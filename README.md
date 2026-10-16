@@ -10,7 +10,7 @@ This is research code. It was tested only on the models and machines listed belo
 
 | Path | What |
 |---|---|
-| `mlx-qwen38/` | MLX loader for Qwen3.8-Flash-Next (MLX GSQ-RCO Q2 repack): `loader.py`, `bench.py`, `profile_run.py`, `run.sh` (RSS/swap watchdog), `expert_io.c` (native pthread pread pool, loaded via ctypes) |
+| `mlx-qwen38/` | MLX loader for Qwen3.8-Flash-Next (MLX GSQ-RCO Q2 repack): `loader.py`, `bench.py`, `profile_run.py`, `server.py` (OpenAI-compatible server), `run.sh` (RSS/swap watchdog), `expert_io.c` (native pthread pread pool, loaded via ctypes) |
 | `mlx-qwen38/trace/` | Routing tracer + analysis (per-layer LRU hit simulation, next-layer router prediction recall) |
 | `llamacpp-bolt/` | llama.cpp expert cache for NVIDIA Nemotron 3.5 Bolt 74B-A9B GGUF: `llama-moe-cache.patch`, `moe_loader.cpp`, `route_trace.cpp`, `analyze_routes.py`, `bench.py` |
 
@@ -50,6 +50,40 @@ Note: stock llama.cpp Metal lacks `kernel_mul_mm_id_map0` for 9 active experts, 
   1. **Trace first (required).** Run `trace/tracer.py`. It runs the reference model and writes `routes.jsonl` (per-token routing and reference greedy tokens) and `trace_meta.json` (prompts and token counts) into `MOE_WORKDIR`. Optional env vars: `QWEN38_RESIDENT_LAYERS` (default 28), `QWEN38_DECODE_TOKENS` (default 128).
   2. **Analyze.** Run `trace/analyze.py`. It reads `routes.jsonl` and `trace_meta.json` and writes `analysis_summary.json`.
   3. **Run the loader.** `./run.sh <python> loader.py ...`. In the default `--mode verify`, `loader.py` reads `routes.jsonl` and `trace_meta.json` to compare its output with the reference, and fails if they are missing. The default `--alloc-mode proportional` uses `analysis_summary.json` to size each layer's cache (if the file is absent, it falls back to an even split). Useful flags: `--budget-gb` / `--budget-pct`, `--prefetch on|off` (default off), `--prefetch-top-m` (default 12), `--prefetch-cap` (default 3), `--mode verify|single`, `--prompt`, `--decode-tokens`.
+
+## OpenAI-compatible server (`mlx-qwen38/server.py`)
+
+`server.py` loads the model once via `loader.OffloadEngine` and serves an OpenAI-compatible API (stdlib `http.server`, default `127.0.0.1:8090`). Requests are processed **one at a time by design** (concurrent requests wait on a lock).
+
+```bash
+cd mlx-qwen38
+./run.sh <python> -u server.py --host 127.0.0.1 --port 8090 \
+  --budget-pct 20 --alloc-mode even --prefetch on --prefetch-top-m 12 --prefetch-cap 3
+kill -TERM <server pid>
+```
+
+Other flags: `--budget-gb`, `--model-path` (or `QWEN38_MODEL`), `--model-id`, `--max-rss-gb`, `--max-swap-growth-gb`. Stop with `kill -TERM`.
+
+Endpoints:
+- `GET /health`, `GET /v1/models`
+- `POST /v1/chat/completions` (streaming SSE and non-streaming)
+- `POST /v1/completions`
+- `POST /v1/responses` (OpenAI Responses API, text only; streaming and non-streaming). `tools`, `previous_response_id`, and image inputs return HTTP 400.
+
+Params: `max_tokens` / `max_output_tokens`, `temperature` (0 = greedy), `top_p`, `stop`, `stream`, `seed`, `enable_thinking` (default false). Responses include `usage` and `timings`.
+
+```bash
+curl -s http://127.0.0.1:8090/health
+curl -s http://127.0.0.1:8090/v1/models
+curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64,"temperature":0}'
+curl -N http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64,"stream":true}'
+curl -s http://127.0.0.1:8090/v1/responses -H 'Content-Type: application/json' \
+  -d '{"input":"Hello","max_output_tokens":64}'
+```
+
+Measured (Mac mini M4 Pro): ~10.2–10.7 tok/s warm decode; `temperature: 0` output is identical to running `loader.py` directly.
 
 ## License
 

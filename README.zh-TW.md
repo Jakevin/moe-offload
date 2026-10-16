@@ -10,7 +10,7 @@
 
 | 路徑 | 說明 |
 |---|---|
-| `mlx-qwen38/` | Qwen3.8-Flash-Next（MLX GSQ-RCO Q2 重新打包）的 MLX 載入器：`loader.py`、`bench.py`、`profile_run.py`、`run.sh`（RSS／swap 監控程式）、`expert_io.c`（原生 pthread pread 執行緒池，透過 ctypes 載入） |
+| `mlx-qwen38/` | Qwen3.8-Flash-Next（MLX GSQ-RCO Q2 重新打包）的 MLX 載入器：`loader.py`、`bench.py`、`profile_run.py`、`server.py`（OpenAI 相容伺服器）、`run.sh`（RSS／swap 監控程式）、`expert_io.c`（原生 pthread pread 執行緒池，透過 ctypes 載入） |
 | `mlx-qwen38/trace/` | 路由追蹤器與分析（逐層 LRU 命中模擬、下一層路由器預測召回率） |
 | `llamacpp-bolt/` | 用於 NVIDIA Nemotron 3.5 Bolt 74B-A9B GGUF 的 llama.cpp 專家快取：`llama-moe-cache.patch`、`moe_loader.cpp`、`route_trace.cpp`、`analyze_routes.py`、`bench.py` |
 
@@ -50,6 +50,40 @@ v1 每個 token 的效能剖析（共 118 ms）：GPU 27%、Python 與 `mx.eval`
   1. **先追蹤（必要）。** 執行 `trace/tracer.py`。它會執行參考模型，並將 `routes.jsonl`（每個 token 的路由與參考貪婪解碼 token）和 `trace_meta.json`（提示詞與 token 數量）寫入 `MOE_WORKDIR`。可選環境變數：`QWEN38_RESIDENT_LAYERS`（預設 28）、`QWEN38_DECODE_TOKENS`（預設 128）。
   2. **分析。** 執行 `trace/analyze.py`。它會讀取 `routes.jsonl` 與 `trace_meta.json`，並寫出 `analysis_summary.json`。
   3. **執行載入器。** `./run.sh <python> loader.py ...`。在預設的 `--mode verify` 下，`loader.py` 會讀取 `routes.jsonl` 與 `trace_meta.json`，將輸出與參考結果比對；若檔案不存在則會失敗。預設的 `--alloc-mode proportional` 會依 `analysis_summary.json` 決定各層快取大小（若無此檔案，則改為平均分配）。常用參數：`--budget-gb` / `--budget-pct`、`--prefetch on|off`（預設 off）、`--prefetch-top-m`（預設 12）、`--prefetch-cap`（預設 3）、`--mode verify|single`、`--prompt`、`--decode-tokens`。
+
+## OpenAI 相容伺服器（`mlx-qwen38/server.py`）
+
+`server.py` 透過 `loader.OffloadEngine` 只載入一次模型，並提供 OpenAI 相容 API（使用標準函式庫 `http.server`，預設 `127.0.0.1:8090`）。**設計上一次只處理一個請求**（同時送出的請求會排隊等待）。
+
+```bash
+cd mlx-qwen38
+./run.sh <python> -u server.py --host 127.0.0.1 --port 8090 \
+  --budget-pct 20 --alloc-mode even --prefetch on --prefetch-top-m 12 --prefetch-cap 3
+kill -TERM <server pid>
+```
+
+其他參數：`--budget-gb`、`--model-path`（或環境變數 `QWEN38_MODEL`）、`--model-id`、`--max-rss-gb`、`--max-swap-growth-gb`。以 `kill -TERM` 停止。
+
+端點：
+- `GET /health`、`GET /v1/models`
+- `POST /v1/chat/completions`（支援 SSE 串流與非串流）
+- `POST /v1/completions`
+- `POST /v1/responses`（OpenAI Responses API，僅支援文字；串流與非串流）。帶入 `tools`、`previous_response_id` 或圖片輸入會回傳 HTTP 400。
+
+參數：`max_tokens` / `max_output_tokens`、`temperature`（0 = 貪婪解碼）、`top_p`、`stop`、`stream`、`seed`、`enable_thinking`（預設 false）。回應包含 `usage` 與 `timings`。
+
+```bash
+curl -s http://127.0.0.1:8090/health
+curl -s http://127.0.0.1:8090/v1/models
+curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64,"temperature":0}'
+curl -N http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64,"stream":true}'
+curl -s http://127.0.0.1:8090/v1/responses -H 'Content-Type: application/json' \
+  -d '{"input":"Hello","max_output_tokens":64}'
+```
+
+實測（Mac mini M4 Pro）：暖機後解碼約 10.2–10.7 tok/s；`temperature: 0` 的輸出與直接執行 `loader.py` 完全相同。
 
 ## 授權
 
