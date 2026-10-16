@@ -1,3 +1,5 @@
+**English** | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
+
 # moe-offload
 
 Experimental expert-offloading loaders for Mixture-of-Experts LLMs on Apple Silicon. The always-used weights stay in unified memory. Routed experts live on SSD and are read on demand into a fixed-budget, per-layer LRU cache. An optional router-based prefetch can read the next layer's experts ahead of time.
@@ -44,7 +46,10 @@ Note: stock llama.cpp Metal lacks `kernel_mul_mm_id_map0` for 9 active experts, 
 ## Usage (sketch)
 
 - llama.cpp: `git checkout 620d2225cc436ab0b001e3200e590e3b286ef9ab && git apply llama-moe-cache.patch`, build with `-DGGML_METAL=ON`, then `make -C llamacpp-bolt` (set `LLAMA_DIR`).
-- MLX: needs an MLX + mlx-vlm build with `qwen4_exp` support. The scripts default to oMLX.app's bundled Python. Set `QWEN38_MODEL` to the model directory and `MOE_WORKDIR` to a working directory, then run `./run.sh <python> loader.py ...`.
+- MLX: needs an MLX + mlx-vlm build with `qwen4_exp` support. The scripts default to oMLX.app's bundled Python. Set `QWEN38_MODEL` to the model directory and `MOE_WORKDIR` to a working directory (all scripts read and write their data files there). Then, in order:
+  1. **Trace first (required).** Run `trace/tracer.py`. It runs the reference model and writes `routes.jsonl` (per-token routing and reference greedy tokens) and `trace_meta.json` (prompts and token counts) into `MOE_WORKDIR`. Optional env vars: `QWEN38_RESIDENT_LAYERS` (default 28), `QWEN38_DECODE_TOKENS` (default 128).
+  2. **Analyze.** Run `trace/analyze.py`. It reads `routes.jsonl` and `trace_meta.json` and writes `analysis_summary.json`.
+  3. **Run the loader.** `./run.sh <python> loader.py ...`. In the default `--mode verify`, `loader.py` reads `routes.jsonl` and `trace_meta.json` to compare its output with the reference, and fails if they are missing. The default `--alloc-mode proportional` uses `analysis_summary.json` to size each layer's cache (if the file is absent, it falls back to an even split). Useful flags: `--budget-gb` / `--budget-pct`, `--prefetch on|off` (default off), `--prefetch-top-m` (default 12), `--prefetch-cap` (default 3), `--mode verify|single`, `--prompt`, `--decode-tokens`.
 
 ## License
 
