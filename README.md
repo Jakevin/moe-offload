@@ -27,6 +27,8 @@ All cached runs produced greedy output identical to the reference run on the tes
 | v2, native pread, fewer syncs, no prefetch | 9.17 | 18.9 | 84.3% | 10.3 GiB |
 | v2 + router prefetch top-12, max 3 per layer | 9.73 | 19.4 | 94.7% | 8.9 GiB |
 
+Prefill tok/s above is `loader.py` on these short test prompts with one-shot (single-pass) prefill and no prompt cache. It does not apply to long prompts through `server.py`, which prefills in chunks (see Prompt cache below).
+
 Profile of v1 per token (118 ms total): GPU 27%, Python and `mx.eval` syncs 41%, SSD reads 29%, bookkeeping 3%. A fully resident llama.cpp GGUF run of this model (different setup) reached 24.6 tok/s. The remaining gap is mostly Python per-layer synchronization.
 
 Next-layer router prediction (mixing the 4 hyper-connection streams the way layer l+1 does, then applying layer l+1's norm and router): recall@10 / @16 / @24 = 83.6% / 94.1% / 96.7%. This comes from a short trace of 2 prompts.
@@ -100,19 +102,21 @@ Limits:
 - Tool-call arguments are emitted once at the end of generation, not token by token.
 - `previous_response_id` is unsupported (send prior `function_call` / `function_call_output` items explicitly). Non-function tool types (e.g. `web_search`) are dropped.
 - Thinking is off by default.
-- Prompt cache is off by default (`--prompt-cache on`, see below). Without it, agent clients' ~15–18k-token prompts spend ~1.5–2 min (or more) in prefill each turn on an M4 Pro. Set client timeouts accordingly.
+- Prompt cache is off by default (`--prompt-cache on`, see below). Prefill time depends on the mode. With one-shot (single-pass) prefill and no memory cap, agent clients' ~15–18k-token prompts took ~1.5–2 min (about 105 s) per turn on an M4 Pro. The server now prefills in chunks (`--prefill-chunk 2048`, the default), and each chunk re-reads the routed experts (about 35 s per pass), so long prompts are slower whenever the cache does not hit: with a 20 GB memory cap, a 14,937-token prompt took 315.7 s TTFT with no cache, 305.9 s on a cache miss and 63.9 s on a cache hit. Set client timeouts accordingly.
 
 ### Prompt cache (`--prompt-cache on`)
 
-Single-session, in-memory cache (`prompt_cache.py`). It snapshots the full model state (linear-attention/GDN conv+SSM state, PLE window, QSA KV + indexer state, offsets, position state) plus next-token logits at reusable prefix points: the end of each prompt (= end of the last confirmed turn) and, once a system+tools prefix has been seen in two conversations, the end of the system message. Snapshots are keyed by exact token IDs plus model path, chat-template hash and control-vector settings, bounded by `--prompt-cache-max-snapshots` (4) and `--prompt-cache-max-gb` (1.5), LRU-evicted, and never shared with the live cache. Prefill runs in fixed chunks of `--prefill-chunk` tokens (default 2048, bounds memory) and only the last position goes through `lm_head`.
+Single-session, in-memory cache (`prompt_cache.py`). It snapshots the full model state (linear-attention/GDN conv+SSM state, PLE window, QSA KV + indexer state, offsets, position state) plus next-token logits at reusable prefix points: the end of each prompt (= end of the last confirmed turn) and, once a system+tools prefix has been seen in two conversations, the end of the system message. Snapshots are keyed by exact token IDs plus model path, chat-template hash and control-vector settings, bounded by `--prompt-cache-max-snapshots` (4) and `--prompt-cache-max-gb` (1.5), LRU-evicted, and never shared with the live cache. Prefill runs in fixed chunks of `--prefill-chunk` tokens (default 2048, bounds memory) and only the last position goes through `lm_head`. Chunk size trades memory for speed: each chunk is another pass over the routed experts (about 35 s per pass), so smaller chunks lower peak memory but make long-prompt prefill slower, while larger chunks (up to one-shot prefill) need fewer passes but more memory.
 
-Measured (M4 Pro 64 GB, 20% expert cache, warm, 3 interleaved rounds; 14,937-token agent prompt, 80.9% reused from the previous 12,089-token turn):
+Measured (M4 Pro 64 GB, 20 GB memory cap, 20% expert cache, warm, 3 interleaved rounds, all modes chunked with `--prefill-chunk 2048`; 14,937-token agent prompt, 80.9% reused from the previous 12,089-token turn):
 
 | | TTFT |
 |---|---|
 | no cache (same 2048 chunking) | 315.7 s |
-| cache miss | 305.9 s (0.97x, CI 0.90–1.04) |
-| cache hit | 63.9 s (**4.94x faster**, CI 4.56–5.36) |
+| cache miss (full chunked prefill) | 305.9 s (0.97x, CI 0.90–1.04) |
+| cache hit (only the non-reused suffix is prefilled) | 63.9 s (**4.94x faster**, 95% CI 4.56–5.36) |
+
+The no-cache and cache-miss times are slower than the one-shot ~105 s figure above (measured with no memory cap) because every 2048-token chunk re-reads the experts; only a cache hit avoids most of that cost.
 
 Cached vs uncached runs with the same chunk boundaries are bit-exact: last-position logits, all 220 state arrays and 32 greedy tokens matched for prefix hits, identical-prompt hits (stored logits, no forward pass) and system-prompt hits. Changing the chunking itself (e.g. vs the original one-shot prefill) can change logits slightly (max |diff| 1.375 here; argmax and 32 greedy tokens unchanged). Peak process footprint 19.0 GB, swap +0. Unit tests: `python3.11 mlx-qwen38/test_prompt_cache.py`.
 
