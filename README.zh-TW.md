@@ -70,7 +70,7 @@ kill -TERM <server pid>
 - `POST /v1/completions`
 - `POST /v1/responses`（OpenAI Responses API；串流與非串流）。支援 function 工具呼叫（見英文 README 的 Tool calling 一節）；`previous_response_id` 或圖片輸入會回傳 HTTP 400。
 
-參數：`max_tokens` / `max_output_tokens`、`temperature`（0 = 貪婪解碼）、`top_p`、`stop`、`stream`、`seed`、`enable_thinking`（預設 false）。回應包含 `usage` 與 `timings`。
+參數：`max_tokens` / `max_completion_tokens` / `max_output_tokens`（預設 4096，可用 `--max-tokens` 調整）、`temperature`（0 = 貪婪解碼）、`top_p`、`stop`、`stream`、`seed`、`enable_thinking`（預設 false）。回應包含 `usage` 與 `timings`。
 
 ```bash
 curl -s http://127.0.0.1:8090/health

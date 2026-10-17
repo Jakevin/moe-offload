@@ -62,7 +62,7 @@ cd mlx-qwen38
 kill -TERM <server pid>
 ```
 
-Other flags: `--budget-gb`, `--model-path` (or `QWEN38_MODEL`), `--model-id`, `--max-rss-gb`, `--max-swap-growth-gb`. Stop with `kill -TERM`.
+Other flags: `--max-tokens` (default output limit when a request omits it; default 4096), `--budget-gb`, `--model-path` (or `QWEN38_MODEL`), `--model-id`, `--max-rss-gb`, `--max-swap-growth-gb`. Stop with `kill -TERM`.
 
 Endpoints:
 - `GET /health`, `GET /v1/models`
@@ -70,7 +70,7 @@ Endpoints:
 - `POST /v1/completions`
 - `POST /v1/responses` (OpenAI Responses API; streaming and non-streaming). Function tools are supported (see Tool calling); `previous_response_id` and image inputs return HTTP 400.
 
-Params: `max_tokens` / `max_output_tokens`, `temperature` (0 = greedy), `top_p`, `stop`, `stream`, `seed`, `enable_thinking` (default false). Responses include `usage` and `timings`.
+Params: `max_tokens` / `max_completion_tokens` / `max_output_tokens` (default 4096, or `--max-tokens`), `temperature` (0 = greedy), `top_p`, `stop`, `stream`, `seed`, `enable_thinking` (default false). Responses include `usage` and `timings`.
 
 ```bash
 curl -s http://127.0.0.1:8090/health
@@ -98,14 +98,14 @@ Limits:
 - Still **one request at a time**.
 - Tool-call arguments are emitted once at the end of generation, not token by token.
 - `previous_response_id` is unsupported (send prior `function_call` / `function_call_output` items explicitly). Non-function tool types (e.g. `web_search`) are dropped.
-- Default `max_tokens` / `max_output_tokens` is still 256; raise it for tool use. Thinking is off by default.
+- Thinking is off by default.
 - No prompt cache between requests: agent clients send ~15–18k-token prompts, so each turn spends ~1.5–2 min in prefill on an M4 Pro. Set client timeouts accordingly.
 
 ```bash
 curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "messages":[{"role":"user","content":"Weather in Taipei? Use the tool."}],
   "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
-  "max_tokens":256,"temperature":0}'
+  "temperature":0}'
 ```
 
 Tested with opencode (`@ai-sdk/openai-compatible` provider, `baseURL: http://127.0.0.1:8090/v1`; run `opencode run ... < /dev/null`, or it waits on stdin) and Codex CLI (custom provider with `wire_api = "responses"`): both completed a read-a-file task via tool calls.

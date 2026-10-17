@@ -39,6 +39,7 @@ import mlx.core as mx  # noqa: E402
 import tool_calls  # noqa: E402
 
 GEN_LOCK = threading.Lock()
+DEFAULT_MAX_TOKENS = 4096  # overridable with --max-tokens
 
 
 def get_stop_token_ids(engine: loader.OffloadEngine) -> set[int]:
@@ -427,10 +428,11 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
             is_chat = path == "/v1/chat/completions"
             engine = self.server.engine
 
-            # Default max_tokens is 256; callers using tools should consider passing a larger
-            # max_tokens / max_completion_tokens (e.g. 512+) for multi-parameter tool calls.
-            raw_max = req.get("max_tokens", req.get("max_completion_tokens", 256))
-            max_tokens = 256 if raw_max is None else int(raw_max)
+            default_max = getattr(self.server, "default_max_tokens", DEFAULT_MAX_TOKENS)
+            raw_max = req.get("max_tokens")
+            if raw_max is None:
+                raw_max = req.get("max_completion_tokens")
+            max_tokens = default_max if raw_max is None else int(raw_max)
             if max_tokens < 0:
                 raise ValueError("'max_tokens' must be non-negative")
 
@@ -518,10 +520,13 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                     norm_tools, raw_tool_choice, messages
                 )
 
-            # Default max_output_tokens is 256; callers using tools should consider passing a
-            # larger value (e.g. 512+) so XML tool call blocks are not truncated.
-            raw_max = req.get("max_output_tokens", req.get("max_tokens", 256))
-            max_output_tokens = 256 if raw_max is None else int(raw_max)
+            default_max = getattr(self.server, "default_max_tokens", DEFAULT_MAX_TOKENS)
+            raw_max = None
+            for key in ("max_output_tokens", "max_tokens", "max_completion_tokens"):
+                if req.get(key) is not None:
+                    raw_max = req[key]
+                    break
+            max_output_tokens = default_max if raw_max is None else int(raw_max)
             if max_output_tokens < 0:
                 raise ValueError("'max_output_tokens' must be non-negative")
 
@@ -1330,6 +1335,7 @@ def main() -> None:
     parser.add_argument("--model-id", type=str, default="qwen3.8-flash-next-offload")
     parser.add_argument("--max-rss-gb", type=float, default=38.0)
     parser.add_argument("--max-swap-growth-gb", type=float, default=8.0)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="Default max_tokens / max_output_tokens when a request omits them")
     args = parser.parse_args()
 
     start_swap_mb = loader.get_swap_used_mb()
@@ -1358,6 +1364,7 @@ def main() -> None:
     )
 
     httpd = OffloadHTTPServer((args.host, args.port), engine=engine, model_id=args.model_id)
+    httpd.default_max_tokens = int(args.max_tokens)
     print(f"[server] listening on http://{args.host}:{args.port}", flush=True)
 
     shutting_down = threading.Event()
