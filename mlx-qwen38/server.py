@@ -141,10 +141,20 @@ def _generate_stream_impl(
 
         # 1. Prefill
         engine.model._ple_cpu_active = False
-        inp = mx.array([prompt_ids], dtype=mx.int32)
         t_pre0 = time.perf_counter()
-        out = lm(inp, cache=cache)
-        next_tok_arr = _sample_next_token(out.logits, temperature, top_p)
+        pcache = getattr(engine, "_prompt_cache", None)
+        if pcache is not None:
+            # Prompt cache: chunked prefill that restores the longest matching snapshot (exact token-ID
+            # prefix + model/template/control-vector key) and stores new ones at reusable prefix points.
+            # Snapshots are taken only at prefill boundaries, so every key token has been consumed; on a
+            # full-prefix hit the stored next-token logits are used (no forward pass).
+            cache, last_logits, pc_info = pcache.prefill(lm, list(prompt_ids))
+            timings["prompt_cache"] = pc_info
+            next_tok_arr = _sample_next_token(last_logits, temperature, top_p)
+        else:
+            inp = mx.array([prompt_ids], dtype=mx.int32)
+            out = lm(inp, cache=cache)
+            next_tok_arr = _sample_next_token(out.logits, temperature, top_p)
         mx.eval(next_tok_arr)
         prefill_sec = time.perf_counter() - t_pre0
         timings["prefill_s"] = round(prefill_sec, 4)
@@ -1349,6 +1359,21 @@ def main() -> None:
     parser.add_argument("--prefetch", choices=["on", "off"], default="on")
     parser.add_argument("--prefetch-top-m", type=int, default=loader.PREFETCH_TOP_M)
     parser.add_argument("--prefetch-cap", type=int, default=loader.PREFETCH_MAX_CAP)
+    parser.add_argument(
+        "--prompt-cache",
+        choices=["on", "off"],
+        default="off",
+        help="In-memory single-session prompt cache (GDN/PLE/KV snapshots at system-prompt end and prompt end).",
+    )
+    parser.add_argument("--prompt-cache-max-snapshots", type=int, default=4)
+    parser.add_argument("--prompt-cache-max-gb", type=float, default=1.5)
+    parser.add_argument(
+        "--prefill-chunk",
+        type=int,
+        default=2048,
+        help="With --prompt-cache on: prefill chunk cap in tokens (bounds prefill memory; 0 = no cap). "
+        "Each chunk re-streams routed experts, so larger chunks prefill faster but use more memory.",
+    )
     parser.add_argument("--model-id", type=str, default="qwen3.8-flash-next-offload")
     parser.add_argument("--max-rss-gb", type=float, default=38.0)
     parser.add_argument("--max-swap-growth-gb", type=float, default=8.0)
@@ -1378,6 +1403,20 @@ def main() -> None:
         prefetch_top_m=args.prefetch_top_m,
         prefetch_cap=args.prefetch_cap,
     )
+    if args.prompt_cache == "on":
+        import prompt_cache  # noqa: E402
+
+        engine._prompt_cache = prompt_cache.PromptCache(
+            engine,
+            max_snapshots=args.prompt_cache_max_snapshots,
+            max_gb=args.prompt_cache_max_gb,
+            chunk_tokens=args.prefill_chunk,
+        )
+        print(
+            f"[server] prompt cache on: max {args.prompt_cache_max_snapshots} snapshots / "
+            f"{args.prompt_cache_max_gb:.1f} GiB, prefill chunk cap={args.prefill_chunk or 'none'}",
+            flush=True,
+        )
     rss_gib = loader.get_rss_kb() / (1024**2)
     print(
         f"[server] Loaded model '{args.model_id}' in {engine.load_seconds:.2f}s | "

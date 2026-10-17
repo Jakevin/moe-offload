@@ -100,7 +100,21 @@ Limits:
 - Tool-call arguments are emitted once at the end of generation, not token by token.
 - `previous_response_id` is unsupported (send prior `function_call` / `function_call_output` items explicitly). Non-function tool types (e.g. `web_search`) are dropped.
 - Thinking is off by default.
-- No prompt cache between requests: agent clients send ~15–18k-token prompts, so each turn spends ~1.5–2 min in prefill on an M4 Pro. Set client timeouts accordingly.
+- Prompt cache is off by default (`--prompt-cache on`, see below). Without it, agent clients' ~15–18k-token prompts spend ~1.5–2 min (or more) in prefill each turn on an M4 Pro. Set client timeouts accordingly.
+
+### Prompt cache (`--prompt-cache on`)
+
+Single-session, in-memory cache (`prompt_cache.py`). It snapshots the full model state (linear-attention/GDN conv+SSM state, PLE window, QSA KV + indexer state, offsets, position state) plus next-token logits at reusable prefix points: the end of each prompt (= end of the last confirmed turn) and, once a system+tools prefix has been seen in two conversations, the end of the system message. Snapshots are keyed by exact token IDs plus model path, chat-template hash and control-vector settings, bounded by `--prompt-cache-max-snapshots` (4) and `--prompt-cache-max-gb` (1.5), LRU-evicted, and never shared with the live cache. Prefill runs in fixed chunks of `--prefill-chunk` tokens (default 2048, bounds memory) and only the last position goes through `lm_head`.
+
+Measured (M4 Pro 64 GB, 20% expert cache, warm, 3 interleaved rounds; 14,937-token agent prompt, 80.9% reused from the previous 12,089-token turn):
+
+| | TTFT |
+|---|---|
+| no cache (same 2048 chunking) | 315.7 s |
+| cache miss | 305.9 s (0.97x, CI 0.90–1.04) |
+| cache hit | 63.9 s (**4.94x faster**, CI 4.56–5.36) |
+
+Cached vs uncached runs with the same chunk boundaries are bit-exact: last-position logits, all 220 state arrays and 32 greedy tokens matched for prefix hits, identical-prompt hits (stored logits, no forward pass) and system-prompt hits. Changing the chunking itself (e.g. vs the original one-shot prefill) can change logits slightly (max |diff| 1.375 here; argmax and 32 greedy tokens unchanged). Peak process footprint 19.0 GB, swap +0. Unit tests: `python3.11 mlx-qwen38/test_prompt_cache.py`.
 
 ```bash
 curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{
