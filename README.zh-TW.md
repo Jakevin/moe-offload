@@ -68,7 +68,7 @@ kill -TERM <server pid>
 - `GET /health`、`GET /v1/models`
 - `POST /v1/chat/completions`（支援 SSE 串流與非串流）
 - `POST /v1/completions`
-- `POST /v1/responses`（OpenAI Responses API，僅支援文字；串流與非串流）。帶入 `tools`、`previous_response_id` 或圖片輸入會回傳 HTTP 400。
+- `POST /v1/responses`（OpenAI Responses API；串流與非串流）。支援 function 工具呼叫（見英文 README 的 Tool calling 一節）；`previous_response_id` 或圖片輸入會回傳 HTTP 400。
 
 參數：`max_tokens` / `max_output_tokens`、`temperature`（0 = 貪婪解碼）、`top_p`、`stop`、`stream`、`seed`、`enable_thinking`（預設 false）。回應包含 `usage` 與 `timings`。
 

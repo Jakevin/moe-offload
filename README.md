@@ -66,9 +66,9 @@ Other flags: `--budget-gb`, `--model-path` (or `QWEN38_MODEL`), `--model-id`, `-
 
 Endpoints:
 - `GET /health`, `GET /v1/models`
-- `POST /v1/chat/completions` (streaming SSE and non-streaming)
+- `POST /v1/chat/completions` (streaming SSE and non-streaming; function tools supported)
 - `POST /v1/completions`
-- `POST /v1/responses` (OpenAI Responses API, text only; streaming and non-streaming). `tools`, `previous_response_id`, and image inputs return HTTP 400.
+- `POST /v1/responses` (OpenAI Responses API; streaming and non-streaming). Function tools are supported (see Tool calling); `previous_response_id` and image inputs return HTTP 400.
 
 Params: `max_tokens` / `max_output_tokens`, `temperature` (0 = greedy), `top_p`, `stop`, `stream`, `seed`, `enable_thinking` (default false). Responses include `usage` and `timings`.
 
@@ -84,6 +84,31 @@ curl -s http://127.0.0.1:8090/v1/responses -H 'Content-Type: application/json' \
 ```
 
 Measured (Mac mini M4 Pro): ~10.2–10.7 tok/s warm decode; `temperature: 0` output is identical to running `loader.py` directly.
+
+### Tool calling
+
+Both `POST /v1/chat/completions` and `POST /v1/responses` support OpenAI-style function calling (`mlx-qwen38/tool_calls.py`, unit tests in `mlx-qwen38/test_tool_calls.py`, no model needed: `python -m unittest test_tool_calls -v`).
+
+- **Model format**: the model's `chat_template.jinja` uses the Qwen3-Coder XML format. `tools` are passed to `apply_chat_template(tools=...)` and rendered exactly as the template does; the model replies with `<tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>\n</function>\n</tool_call>`. Parameter values are typed from each tool's JSON schema. Multiple calls, missing closing tags and a JSON `<tool_call>{"name":..,"arguments":..}</tool_call>` fallback are handled.
+- **Chat Completions**: accepts `tools`, `tool_choice` (`auto`, `none`, `required`, or a named function), `parallel_tool_calls` (accepted, ignored); assistant messages with `tool_calls` and `role: "tool"` messages are accepted back. Returns `message.tool_calls` with `finish_reason: "tool_calls"`. Streaming sends text deltas before the call, then one `delta.tool_calls` chunk per call (full arguments), then `finish_reason: "tool_calls"` and `[DONE]`.
+- **Responses**: accepts flat `{"type":"function","name",...}` tools, `function_call` and `function_call_output` input items (`reasoning` items skipped, `developer` mapped to `system`). Output contains an optional `message` item followed by `function_call` items (`call_id`, `name`, `arguments`). Streaming emits `response.output_item.added`, `response.function_call_arguments.delta`, `response.function_call_arguments.done`, `response.output_item.done`, then `response.completed`.
+- **Generation thread**: all MLX prefill/decode runs on one dedicated worker thread (fixes `There is no Stream(gpu, N) in current thread` errors when consecutive long requests landed on different HTTP handler threads).
+
+Limits:
+- Still **one request at a time**.
+- Tool-call arguments are emitted once at the end of generation, not token by token.
+- `previous_response_id` is unsupported (send prior `function_call` / `function_call_output` items explicitly). Non-function tool types (e.g. `web_search`) are dropped.
+- Default `max_tokens` / `max_output_tokens` is still 256; raise it for tool use. Thinking is off by default.
+- No prompt cache between requests: agent clients send ~15–18k-token prompts, so each turn spends ~1.5–2 min in prefill on an M4 Pro. Set client timeouts accordingly.
+
+```bash
+curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages":[{"role":"user","content":"Weather in Taipei? Use the tool."}],
+  "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
+  "max_tokens":256,"temperature":0}'
+```
+
+Tested with opencode (`@ai-sdk/openai-compatible` provider, `baseURL: http://127.0.0.1:8090/v1`; run `opencode run ... < /dev/null`, or it waits on stdin) and Codex CLI (custom provider with `wire_api = "responses"`): both completed a read-a-file task via tool calls.
 
 ## License
 

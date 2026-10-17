@@ -68,7 +68,7 @@ kill -TERM <server pid>
 - `GET /health`、`GET /v1/models`
 - `POST /v1/chat/completions`（支持 SSE 流式与非流式）
 - `POST /v1/completions`
-- `POST /v1/responses`（OpenAI Responses API，仅支持文本；流式与非流式）。传入 `tools`、`previous_response_id` 或图片输入会返回 HTTP 400。
+- `POST /v1/responses`（OpenAI Responses API；流式与非流式）。支持 function 工具调用（见英文 README 的 Tool calling 一节）；`previous_response_id` 或图片输入会返回 HTTP 400。
 
 参数：`max_tokens` / `max_output_tokens`、`temperature`（0 = 贪婪解码）、`top_p`、`stop`、`stream`、`seed`、`enable_thinking`（默认 false）。响应包含 `usage` 和 `timings`。
 

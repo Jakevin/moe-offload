@@ -34,8 +34,9 @@ _THIS_DIR = str(Path(__file__).resolve().parent)
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
-import loader  # noqa: E402  (sets sys.path for oMLX and mx.set_cache_limit(2GB))
+import loader  # noqa: E402  (sets sys.path and mx.set_cache_limit(2GB))
 import mlx.core as mx  # noqa: E402
+import tool_calls  # noqa: E402
 
 GEN_LOCK = threading.Lock()
 
@@ -105,7 +106,7 @@ def _sample_next_token(logits: mx.array, temperature: float, top_p: float) -> mx
     return sampled[:, None]
 
 
-def generate_stream(
+def _generate_stream_impl(
     engine: loader.OffloadEngine,
     prompt_ids: list[int],
     max_tokens: int,
@@ -189,32 +190,65 @@ def generate_stream(
         mx.clear_cache()
 
 
+
+# MLX streams are per-thread: running prefill/decode on different HTTP handler
+# threads across requests fails with "There is no Stream(gpu, N) in current
+# thread". All generation therefore runs on one persistent worker thread.
+import queue as _queue
+
+_GEN_JOBS: "_queue.Queue" = _queue.Queue()
+_GEN_DONE = object()
+
+
+def _gen_worker_loop() -> None:
+    while True:
+        args, kwargs, out_q, cancel = _GEN_JOBS.get()
+        gen = None
+        try:
+            gen = _generate_stream_impl(*args, **kwargs)
+            for tok in gen:
+                if cancel.is_set():
+                    break
+                out_q.put(("tok", tok))
+        except BaseException as exc:  # noqa: BLE001
+            out_q.put(("err", exc))
+        finally:
+            if gen is not None:
+                try:
+                    gen.close()
+                except Exception:
+                    pass
+            out_q.put(("done", None))
+
+
+_GEN_WORKER = threading.Thread(target=_gen_worker_loop, name="mlx-gen-worker", daemon=True)
+_GEN_WORKER.start()
+
+
+def generate_stream(*args: Any, **kwargs: Any) -> Iterator[int]:
+    """Run _generate_stream_impl on the dedicated MLX worker thread and yield its tokens."""
+    out_q: "_queue.Queue" = _queue.Queue()
+    cancel = threading.Event()
+    _GEN_JOBS.put((args, kwargs, out_q, cancel))
+    finished = False
+    try:
+        while True:
+            kind, val = out_q.get()
+            if kind == "tok":
+                yield val
+            elif kind == "err":
+                raise val
+            else:
+                finished = True
+                return
+    finally:
+        if not finished:
+            cancel.set()
+            while out_q.get()[0] != "done":
+                pass
+
 def _normalize_messages(messages: Any) -> list[dict[str, Any]]:
-    if not isinstance(messages, list) or not messages:
-        raise ValueError("'messages' must be a non-empty list")
-    normalized: list[dict[str, Any]] = []
-    for msg in messages:
-        if not isinstance(msg, dict) or "role" not in msg:
-            raise ValueError("Each message must be an object with a 'role' field")
-        content = msg.get("content", "")
-        if content is None:
-            text_content = ""
-        elif isinstance(content, str):
-            text_content = content
-        elif isinstance(content, list):
-            parts: list[str] = []
-            for part in content:
-                if isinstance(part, str):
-                    parts.append(part)
-                elif isinstance(part, dict) and part.get("type", "text") == "text":
-                    parts.append(str(part.get("text", "")))
-            text_content = "".join(parts)
-        else:
-            raise ValueError("Message 'content' must be a string or list of text parts")
-        msg_copy = dict(msg)
-        msg_copy["content"] = text_content
-        normalized.append(msg_copy)
-    return normalized
+    return tool_calls.convert_chat_messages(messages)
 
 
 def _normalize_responses_input(
@@ -222,73 +256,14 @@ def _normalize_responses_input(
     instructions: Any = None,
 ) -> list[dict[str, Any]]:
     """Validate and normalize OpenAI Responses API 'input' and 'instructions' into chat messages."""
-    if raw_input is None:
-        raise ValueError("Missing required parameter: 'input'")
-
-    messages: list[dict[str, Any]] = []
-    if instructions is not None:
-        if not isinstance(instructions, str):
-            raise ValueError("'instructions' must be a string")
-        if instructions:
-            messages.append({"role": "system", "content": instructions})
-
-    if isinstance(raw_input, str):
-        if not raw_input:
-            raise ValueError("'input' string must be non-empty")
-        messages.append({"role": "user", "content": raw_input})
-        return messages
-
-    if isinstance(raw_input, list):
-        if not raw_input:
-            raise ValueError("'input' list must be non-empty")
-        for item in raw_input:
-            if not isinstance(item, dict):
-                raise ValueError("Each item in 'input' must be an object")
-            item_type = item.get("type", "message")
-            if item_type is None:
-                item_type = "message"
-            if item_type != "message":
-                raise ValueError(
-                    f"Unsupported input item type '{item_type}': only 'message' items are supported"
-                )
-            role = item.get("role")
-            if not isinstance(role, str) or not role:
-                raise ValueError("Each message item in 'input' must have a non-empty 'role' field")
-            if "content" not in item or item["content"] is None:
-                raise ValueError("Each message item in 'input' must have a 'content' field")
-            content = item["content"]
-            if isinstance(content, str):
-                text_content = content
-            elif isinstance(content, list):
-                parts: list[str] = []
-                for part in content:
-                    if not isinstance(part, dict):
-                        raise ValueError("Each content part in 'input' must be an object")
-                    part_type = part.get("type")
-                    if part_type not in ("input_text", "output_text", "text"):
-                        raise ValueError(
-                            f"Unsupported content part type '{part_type}': only text content parts "
-                            "('input_text', 'output_text', 'text') are supported"
-                        )
-                    part_text = part.get("text")
-                    if not isinstance(part_text, str):
-                        raise ValueError(
-                            f"Content part of type '{part_type}' must include a string 'text' field"
-                        )
-                    parts.append(part_text)
-                text_content = "".join(parts)
-            else:
-                raise ValueError("Message 'content' in 'input' must be a string or list of content parts")
-            messages.append({"role": role, "content": text_content})
-        return messages
-
-    raise ValueError("'input' must be a string or a list of message items")
+    return tool_calls.convert_responses_input(raw_input, instructions=instructions)
 
 
 def _encode_chat_messages(
     engine: loader.OffloadEngine,
     messages: list[dict[str, Any]],
     req: dict[str, Any],
+    tools: list[dict[str, Any]] | None = None,
 ) -> list[int]:
     """Apply chat template and tokenize messages identically for chat completions and responses."""
     ct_kwargs = req.get("chat_template_kwargs")
@@ -298,12 +273,22 @@ def _encode_chat_messages(
         enable_thinking = bool(ct_kwargs["enable_thinking"])
     else:
         enable_thinking = False
-    formatted = engine.tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=enable_thinking,
-    )
+
+    if tools:
+        formatted = engine.tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+    else:
+        formatted = engine.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
     return engine.tokenizer.encode(formatted, add_special_tokens=False)
 
 
@@ -442,6 +427,8 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
             is_chat = path == "/v1/chat/completions"
             engine = self.server.engine
 
+            # Default max_tokens is 256; callers using tools should consider passing a larger
+            # max_tokens / max_completion_tokens (e.g. 512+) for multi-parameter tool calls.
             raw_max = req.get("max_tokens", req.get("max_completion_tokens", 256))
             max_tokens = 256 if raw_max is None else int(raw_max)
             if max_tokens < 0:
@@ -457,9 +444,21 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                 isinstance(stream_opts, dict) and stream_opts.get("include_usage", False)
             )
 
+            effective_tools: list[dict[str, Any]] = []
             if is_chat:
                 messages = _normalize_messages(req.get("messages"))
-                prompt_ids = _encode_chat_messages(engine, messages, req)
+                raw_tools = req.get("tools")
+                raw_tool_choice = req.get("tool_choice")
+                # parallel_tool_calls is accepted for OpenAI compatibility and ignored
+                _parallel_tool_calls = req.get("parallel_tool_calls")
+                if raw_tools is not None or raw_tool_choice is not None:
+                    norm_tools = tool_calls.normalize_tools(raw_tools)
+                    effective_tools, messages = tool_calls.apply_tool_choice(
+                        norm_tools, raw_tool_choice, messages
+                    )
+                prompt_ids = _encode_chat_messages(
+                    engine, messages, req, tools=effective_tools or None
+                )
             else:
                 prompt = req.get("prompt")
                 if not isinstance(prompt, str) or not prompt:
@@ -483,9 +482,11 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                 stream=stream,
                 seed=seed,
                 include_usage_chunk=include_usage_chunk,
+                tools=effective_tools if is_chat else None,
             )
         except Exception as exc:
             try:
+                import traceback; traceback.print_exc()
                 self._send_error_json(500, str(exc), "server_error")
             except Exception:
                 pass
@@ -500,19 +501,25 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                     "'previous_response_id' is not supported by this endpoint (server is stateless)"
                 )
 
-            tools = req.get("tools")
-            if tools is not None:
-                if not isinstance(tools, list):
-                    raise ValueError("'tools' must be a list")
-                if len(tools) > 0:
-                    raise ValueError("'tools' is not supported by this endpoint (must be empty or omitted)")
-
             if "input" not in req or req["input"] is None:
                 raise ValueError("Missing required parameter: 'input'")
 
             instructions = req.get("instructions")
             messages = _normalize_responses_input(req["input"], instructions=instructions)
 
+            raw_tools = req.get("tools")
+            raw_tool_choice = req.get("tool_choice")
+            # parallel_tool_calls is accepted for OpenAI compatibility and ignored
+            _parallel_tool_calls = req.get("parallel_tool_calls")
+            effective_tools: list[dict[str, Any]] = []
+            if raw_tools is not None or raw_tool_choice is not None:
+                norm_tools = tool_calls.normalize_tools(raw_tools)
+                effective_tools, messages = tool_calls.apply_tool_choice(
+                    norm_tools, raw_tool_choice, messages
+                )
+
+            # Default max_output_tokens is 256; callers using tools should consider passing a
+            # larger value (e.g. 512+) so XML tool call blocks are not truncated.
             raw_max = req.get("max_output_tokens", req.get("max_tokens", 256))
             max_output_tokens = 256 if raw_max is None else int(raw_max)
             if max_output_tokens < 0:
@@ -530,7 +537,9 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                 else self.server.model_id
             )
 
-            prompt_ids = _encode_chat_messages(engine, messages, req)
+            prompt_ids = _encode_chat_messages(
+                engine, messages, req, tools=effective_tools or None
+            )
             if not prompt_ids:
                 raise ValueError("Encoded prompt produced 0 tokens")
         except Exception as exc:
@@ -548,9 +557,11 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                 seed=seed,
                 resp_model=resp_model,
                 instructions=instructions,
+                tools=effective_tools,
             )
         except Exception as exc:
             try:
+                import traceback; traceback.print_exc()
                 self._send_error_json(500, str(exc), "server_error")
             except Exception:
                 pass
@@ -567,6 +578,7 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
         seed: Any,
         resp_model: str,
         instructions: str | None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> None:
         engine = self.server.engine
         resp_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -574,6 +586,7 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
         created_at = int(time.time())
         n_prompt = len(prompt_ids)
         seq_num = 0
+        has_tools = bool(tools)
 
         def next_seq() -> int:
             nonlocal seq_num
@@ -623,6 +636,60 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
             final_text = ""
             stopped_by_str = False
             client_disconnected = False
+            stream_parser = tool_calls.ToolCallStreamParser(tools) if (stream and has_tools) else None
+            msg_item_started = False
+
+            def ensure_msg_item_started() -> None:
+                nonlocal msg_item_started
+                if msg_item_started:
+                    return
+                msg_item_started = True
+                self._write_sse_event(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "sequence_number": next_seq(),
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "id": msg_id,
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": [],
+                        },
+                    },
+                )
+                self._write_sse_event(
+                    "response.content_part.added",
+                    {
+                        "type": "response.content_part.added",
+                        "sequence_number": next_seq(),
+                        "item_id": msg_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                        },
+                    },
+                )
+
+            def emit_response_text_delta(piece: str) -> None:
+                if not piece:
+                    return
+                ensure_msg_item_started()
+                self._write_sse_event(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "sequence_number": next_seq(),
+                        "item_id": msg_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": piece,
+                    },
+                )
 
             try:
                 if stream:
@@ -656,36 +723,8 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                             "response": initial_resp,
                         },
                     )
-                    self._write_sse_event(
-                        "response.output_item.added",
-                        {
-                            "type": "response.output_item.added",
-                            "sequence_number": next_seq(),
-                            "output_index": 0,
-                            "item": {
-                                "type": "message",
-                                "id": msg_id,
-                                "role": "assistant",
-                                "status": "in_progress",
-                                "content": [],
-                            },
-                        },
-                    )
-                    self._write_sse_event(
-                        "response.content_part.added",
-                        {
-                            "type": "response.content_part.added",
-                            "sequence_number": next_seq(),
-                            "item_id": msg_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "part": {
-                                "type": "output_text",
-                                "text": "",
-                                "annotations": [],
-                            },
-                        },
-                    )
+                    if not has_tools:
+                        ensure_msg_item_started()
 
                 for tok_id in gen:
                     generated_ids.append(tok_id)
@@ -703,17 +742,12 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                         if stream and len(final_text) > emitted_len:
                             piece = final_text[emitted_len:]
                             emitted_len = len(final_text)
-                            self._write_sse_event(
-                                "response.output_text.delta",
-                                {
-                                    "type": "response.output_text.delta",
-                                    "sequence_number": next_seq(),
-                                    "item_id": msg_id,
-                                    "output_index": 0,
-                                    "content_index": 0,
-                                    "delta": piece,
-                                },
-                            )
+                            if stream_parser is not None:
+                                for ev_kind, ev_text in stream_parser.feed(piece):
+                                    if ev_kind == "text" and ev_text:
+                                        emit_response_text_delta(ev_text)
+                            else:
+                                emit_response_text_delta(piece)
                         break
 
                     final_text = full_text
@@ -723,30 +757,46 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                         if safe_end > emitted_len:
                             piece = full_text[emitted_len:safe_end]
                             emitted_len = safe_end
-                            self._write_sse_event(
-                                "response.output_text.delta",
-                                {
-                                    "type": "response.output_text.delta",
-                                    "sequence_number": next_seq(),
-                                    "item_id": msg_id,
-                                    "output_index": 0,
-                                    "content_index": 0,
-                                    "delta": piece,
-                                },
-                            )
+                            if stream_parser is not None:
+                                for ev_kind, ev_text in stream_parser.feed(piece):
+                                    if ev_kind == "text" and ev_text:
+                                        emit_response_text_delta(ev_text)
+                            else:
+                                emit_response_text_delta(piece)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 client_disconnected = True
             finally:
                 gen.close()
 
+            parsed_calls: list[dict[str, Any]] = []
+            remaining_stream_text = ""
+            if has_tools:
+                if stream and stream_parser is not None:
+                    tail_events: list[tuple[str, str]] = []
+                    if not stopped_by_str and len(final_text) > emitted_len:
+                        piece = final_text[emitted_len:]
+                        emitted_len = len(final_text)
+                        tail_events = stream_parser.feed(piece)
+                    fin_text, parsed_calls = stream_parser.finish()
+                    tail_pieces = [t for k, t in tail_events if k == "text" and t]
+                    if fin_text:
+                        tail_pieces.append(fin_text)
+                    remaining_stream_text = "".join(tail_pieces)
+                    content_text, _ = tool_calls.parse_tool_calls(final_text, tools)
+                else:
+                    content_text, parsed_calls = tool_calls.parse_tool_calls(final_text, tools)
+            else:
+                content_text = final_text
+
             timings_raw = getattr(engine, "_last_timings", {})
             stopped_by_tok = bool(timings_raw.get("stopped_by_token", False))
             is_stop = (
-                stopped_by_str
+                bool(parsed_calls)
+                or stopped_by_str
                 or stopped_by_tok
                 or len(generated_ids) < max_output_tokens
             )
-            finish_reason = "stop" if is_stop else "length"
+            finish_reason = "tool_calls" if parsed_calls else ("stop" if is_stop else "length")
             resp_status = "completed" if is_stop else "incomplete"
             incomplete_details = (
                 None if is_stop else {"reason": "max_output_tokens"}
@@ -776,9 +826,24 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
             if client_disconnected:
                 return
 
+            fc_items: list[dict[str, Any]] = []
+            for tc in parsed_calls:
+                fc_items.append(
+                    {
+                        "type": "function_call",
+                        "id": f"fc_{uuid.uuid4().hex[:24]}",
+                        "call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"],
+                        "status": "completed",
+                    }
+                )
+
+            output_text_str = content_text or ""
+            include_msg_item = bool(output_text_str) or not fc_items
             done_part = {
                 "type": "output_text",
-                "text": final_text,
+                "text": output_text_str,
                 "annotations": [],
             }
             done_item = {
@@ -788,62 +853,113 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                 "status": "completed",
                 "content": [done_part],
             }
+            output_list: list[dict[str, Any]] = []
+            if include_msg_item:
+                output_list.append(done_item)
+            output_list.extend(fc_items)
+
             final_resp_obj = build_response_obj(
                 status=resp_status,
-                output_list=[done_item],
-                output_text_val=final_text,
+                output_list=output_list,
+                output_text_val=output_text_str,
                 usage_val=usage,
                 incomplete_details_val=incomplete_details,
             )
 
             if stream:
                 try:
-                    if not stopped_by_str and len(final_text) > emitted_len:
-                        piece = final_text[emitted_len:]
-                        emitted_len = len(final_text)
+                    if not has_tools:
+                        if not stopped_by_str and len(final_text) > emitted_len:
+                            piece = final_text[emitted_len:]
+                            emitted_len = len(final_text)
+                            emit_response_text_delta(piece)
+                    elif remaining_stream_text:
+                        emit_response_text_delta(remaining_stream_text)
+
+                    if include_msg_item:
+                        ensure_msg_item_started()
                         self._write_sse_event(
-                            "response.output_text.delta",
+                            "response.output_text.done",
                             {
-                                "type": "response.output_text.delta",
+                                "type": "response.output_text.done",
                                 "sequence_number": next_seq(),
                                 "item_id": msg_id,
                                 "output_index": 0,
                                 "content_index": 0,
-                                "delta": piece,
+                                "text": output_text_str,
+                            },
+                        )
+                        self._write_sse_event(
+                            "response.content_part.done",
+                            {
+                                "type": "response.content_part.done",
+                                "sequence_number": next_seq(),
+                                "item_id": msg_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "part": done_part,
+                            },
+                        )
+                        self._write_sse_event(
+                            "response.output_item.done",
+                            {
+                                "type": "response.output_item.done",
+                                "sequence_number": next_seq(),
+                                "output_index": 0,
+                                "item": done_item,
                             },
                         )
 
-                    self._write_sse_event(
-                        "response.output_text.done",
-                        {
-                            "type": "response.output_text.done",
-                            "sequence_number": next_seq(),
-                            "item_id": msg_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "text": final_text,
-                        },
-                    )
-                    self._write_sse_event(
-                        "response.content_part.done",
-                        {
-                            "type": "response.content_part.done",
-                            "sequence_number": next_seq(),
-                            "item_id": msg_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "part": done_part,
-                        },
-                    )
-                    self._write_sse_event(
-                        "response.output_item.done",
-                        {
-                            "type": "response.output_item.done",
-                            "sequence_number": next_seq(),
-                            "output_index": 0,
-                            "item": done_item,
-                        },
-                    )
+                    fc_base_idx = 1 if include_msg_item else 0
+                    for idx, fc_item in enumerate(fc_items):
+                        out_idx = fc_base_idx + idx
+                        self._write_sse_event(
+                            "response.output_item.added",
+                            {
+                                "type": "response.output_item.added",
+                                "sequence_number": next_seq(),
+                                "output_index": out_idx,
+                                "item": {
+                                    "type": "function_call",
+                                    "id": fc_item["id"],
+                                    "call_id": fc_item["call_id"],
+                                    "name": fc_item["name"],
+                                    "arguments": "",
+                                    "status": "in_progress",
+                                },
+                            },
+                        )
+                        self._write_sse_event(
+                            "response.function_call_arguments.delta",
+                            {
+                                "type": "response.function_call_arguments.delta",
+                                "sequence_number": next_seq(),
+                                "item_id": fc_item["id"],
+                                "output_index": out_idx,
+                                "delta": fc_item["arguments"],
+                            },
+                        )
+                        self._write_sse_event(
+                            "response.function_call_arguments.done",
+                            {
+                                "type": "response.function_call_arguments.done",
+                                "sequence_number": next_seq(),
+                                "item_id": fc_item["id"],
+                                "output_index": out_idx,
+                                "name": fc_item["name"],
+                                "arguments": fc_item["arguments"],
+                            },
+                        )
+                        self._write_sse_event(
+                            "response.output_item.done",
+                            {
+                                "type": "response.output_item.done",
+                                "sequence_number": next_seq(),
+                                "output_index": out_idx,
+                                "item": fc_item,
+                            },
+                        )
+
                     self._write_sse_event(
                         "response.completed",
                         {
@@ -870,12 +986,14 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
         stream: bool,
         seed: Any,
         include_usage_chunk: bool,
+        tools: list[dict[str, Any]] | None = None,
     ) -> None:
         engine = self.server.engine
         model_id = self.server.model_id
         cmpl_id = f"{'chatcmpl' if is_chat else 'cmpl'}-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         n_prompt = len(prompt_ids)
+        has_tools = bool(is_chat and tools)
 
         with GEN_LOCK:
             if seed is not None:
@@ -895,6 +1013,7 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
             final_text = ""
             stopped_by_str = False
             client_disconnected = False
+            stream_parser = tool_calls.ToolCallStreamParser(tools) if (stream and has_tools) else None
 
             try:
                 if stream:
@@ -938,7 +1057,12 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                         if stream and len(final_text) > emitted_len:
                             piece = final_text[emitted_len:]
                             emitted_len = len(final_text)
-                            self._emit_delta_chunk(cmpl_id, created, model_id, is_chat, piece)
+                            if stream_parser is not None:
+                                for ev_kind, ev_text in stream_parser.feed(piece):
+                                    if ev_kind == "text" and ev_text:
+                                        self._emit_delta_chunk(cmpl_id, created, model_id, is_chat, ev_text)
+                            else:
+                                self._emit_delta_chunk(cmpl_id, created, model_id, is_chat, piece)
                         break
 
                     final_text = full_text
@@ -948,19 +1072,47 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                         if safe_end > emitted_len:
                             piece = full_text[emitted_len:safe_end]
                             emitted_len = safe_end
-                            self._emit_delta_chunk(cmpl_id, created, model_id, is_chat, piece)
+                            if stream_parser is not None:
+                                for ev_kind, ev_text in stream_parser.feed(piece):
+                                    if ev_kind == "text" and ev_text:
+                                        self._emit_delta_chunk(cmpl_id, created, model_id, is_chat, ev_text)
+                            else:
+                                self._emit_delta_chunk(cmpl_id, created, model_id, is_chat, piece)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 client_disconnected = True
             finally:
                 gen.close()
 
+            parsed_calls: list[dict[str, Any]] = []
+            remaining_stream_text = ""
+            if has_tools:
+                if stream and stream_parser is not None:
+                    tail_events_chat: list[tuple[str, str]] = []
+                    if not stopped_by_str and len(final_text) > emitted_len:
+                        piece = final_text[emitted_len:]
+                        emitted_len = len(final_text)
+                        tail_events_chat = stream_parser.feed(piece)
+                    fin_chat_text, parsed_calls = stream_parser.finish()
+                    tail_chat_pieces = [t for k, t in tail_events_chat if k == "text" and t]
+                    if fin_chat_text:
+                        tail_chat_pieces.append(fin_chat_text)
+                    remaining_stream_text = "".join(tail_chat_pieces)
+                    content_text, _ = tool_calls.parse_tool_calls(final_text, tools)
+                else:
+                    content_text, parsed_calls = tool_calls.parse_tool_calls(final_text, tools)
+            else:
+                content_text = final_text
+
             timings_raw = getattr(engine, "_last_timings", {})
             stopped_by_tok = bool(timings_raw.get("stopped_by_token", False))
-            finish_reason = (
-                "stop"
-                if (stopped_by_str or stopped_by_tok or len(generated_ids) < max_tokens)
-                else "length"
-            )
+            if parsed_calls:
+                finish_reason = "tool_calls"
+            else:
+                finish_reason = (
+                    "stop"
+                    if (stopped_by_str or stopped_by_tok or len(generated_ids) < max_tokens)
+                    else "length"
+                )
             n_comp = len(generated_ids)
             usage = {
                 "prompt_tokens": n_prompt,
@@ -986,10 +1138,44 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
 
             if stream:
                 try:
-                    if not stopped_by_str and len(final_text) > emitted_len:
-                        piece = final_text[emitted_len:]
-                        emitted_len = len(final_text)
-                        self._emit_delta_chunk(cmpl_id, created, model_id, is_chat, piece)
+                    if not has_tools:
+                        if not stopped_by_str and len(final_text) > emitted_len:
+                            piece = final_text[emitted_len:]
+                            emitted_len = len(final_text)
+                            self._emit_delta_chunk(cmpl_id, created, model_id, is_chat, piece)
+                    else:
+                        if remaining_stream_text:
+                            self._emit_delta_chunk(
+                                cmpl_id, created, model_id, is_chat, remaining_stream_text
+                            )
+                        for idx, tc in enumerate(parsed_calls):
+                            self._write_sse(
+                                {
+                                    "id": cmpl_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {
+                                                "tool_calls": [
+                                                    {
+                                                        "index": idx,
+                                                        "id": tc["id"],
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": tc["function"]["name"],
+                                                            "arguments": tc["function"]["arguments"],
+                                                        },
+                                                    }
+                                                ]
+                                            },
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                            )
 
                     end_choice = (
                         {"index": 0, "delta": {}, "finish_reason": finish_reason}
@@ -1024,6 +1210,17 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if is_chat:
+                if parsed_calls:
+                    msg_payload: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": content_text,
+                        "tool_calls": parsed_calls,
+                    }
+                else:
+                    msg_payload = {
+                        "role": "assistant",
+                        "content": content_text if content_text is not None else "",
+                    }
                 resp = {
                     "id": cmpl_id,
                     "object": "chat.completion",
@@ -1032,7 +1229,7 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                     "choices": [
                         {
                             "index": 0,
-                            "message": {"role": "assistant", "content": final_text},
+                            "message": msg_payload,
                             "finish_reason": finish_reason,
                         }
                     ],
