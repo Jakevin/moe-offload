@@ -62,7 +62,7 @@ cd mlx-qwen38
 kill -TERM <server pid>
 ```
 
-Other flags: `--max-tokens` (default output limit when a request omits it; default 4096), `--budget-gb`, `--model-path` (or `QWEN38_MODEL`), `--model-id`, `--max-rss-gb`, `--max-swap-growth-gb`. Stop with `kill -TERM`.
+Other flags: `--max-tokens` (default output limit when a request omits it; default `-1` = unlimited, like llama.cpp and Ollama: generation stops at EOS / a stop string or when the context is full; `N` sets a fixed default), `--budget-gb`, `--model-path` (or `QWEN38_MODEL`), `--model-id`, `--max-rss-gb`, `--max-swap-growth-gb`. Stop with `kill -TERM`.
 
 Endpoints:
 - `GET /health`, `GET /v1/models`
@@ -70,7 +70,7 @@ Endpoints:
 - `POST /v1/completions`
 - `POST /v1/responses` (OpenAI Responses API; streaming and non-streaming). Function tools are supported (see Tool calling); `previous_response_id` and image inputs return HTTP 400.
 
-Params: `max_tokens` / `max_completion_tokens` / `max_output_tokens` (default 4096, or `--max-tokens`), `temperature` (0 = greedy), `top_p`, `stop`, `stream`, `seed`, `enable_thinking` (default false). Responses include `usage` and `timings`.
+Params: `max_tokens` / `max_completion_tokens` / `max_output_tokens` (default unlimited, capped at the remaining context; a request value, or `-1` for unlimited, overrides `--max-tokens`), `temperature` (0 = greedy), `top_p`, `stop`, `stream`, `seed`, `enable_thinking` (default false). Responses include `usage` and `timings`.
 
 ```bash
 curl -s http://127.0.0.1:8090/health
@@ -92,6 +92,7 @@ Both `POST /v1/chat/completions` and `POST /v1/responses` support OpenAI-style f
 - **Model format**: the model's `chat_template.jinja` uses the Qwen3-Coder XML format. `tools` are passed to `apply_chat_template(tools=...)` and rendered exactly as the template does; the model replies with `<tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>\n</function>\n</tool_call>`. Parameter values are typed from each tool's JSON schema. Multiple calls, missing closing tags and a JSON `<tool_call>{"name":..,"arguments":..}</tool_call>` fallback are handled.
 - **Chat Completions**: accepts `tools`, `tool_choice` (`auto`, `none`, `required`, or a named function), `parallel_tool_calls` (accepted, ignored); assistant messages with `tool_calls` and `role: "tool"` messages are accepted back. Returns `message.tool_calls` with `finish_reason: "tool_calls"`. Streaming sends text deltas before the call, then one `delta.tool_calls` chunk per call (full arguments), then `finish_reason: "tool_calls"` and `[DONE]`.
 - **Responses**: accepts flat `{"type":"function","name",...}` tools, `function_call` and `function_call_output` input items (`reasoning` items skipped, `developer` mapped to `system`). Output contains an optional `message` item followed by `function_call` items (`call_id`, `name`, `arguments`). Streaming emits `response.output_item.added`, `response.function_call_arguments.delta`, `response.function_call_arguments.done`, `response.output_item.done`, then `response.completed`.
+- **Output limit**: no default `max_tokens`, so long tool-call arguments are not cut off; generation ends at EOS or when prompt + output reach the model context (`max_position_embeddings`, 262144 here; `finish_reason: "length"` / Responses `incomplete`). Send `max_tokens` / `max_output_tokens`, or start the server with `--max-tokens N`, to bound a turn.
 - **Generation thread**: all MLX prefill/decode runs on one dedicated worker thread (fixes `There is no Stream(gpu, N) in current thread` errors when consecutive long requests landed on different HTTP handler threads).
 
 Limits:

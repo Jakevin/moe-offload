@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import unittest
 
+import gen_limits
 import tool_calls
 
 try:
@@ -569,6 +570,87 @@ class TestToolCalls(unittest.TestCase):
         )
         self.assertIn("<|im_start|>user\n<tool_response>\n{\"temp_c\": 21}\n</tool_response><|im_end|>", rendered)
         self.assertTrue(rendered.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
+
+
+
+CHAT_MAX_KEYS = ("max_tokens", "max_completion_tokens")
+RESPONSES_MAX_KEYS = ("max_output_tokens", "max_tokens", "max_completion_tokens")
+
+
+class TestGenLimits(unittest.TestCase):
+    """Default output limit: unlimited (-1), capped at the remaining context."""
+
+    def test_parse_limit(self) -> None:
+        self.assertIsNone(gen_limits.parse_limit(-1))
+        self.assertIsNone(gen_limits.parse_limit("-1"))
+        self.assertEqual(gen_limits.parse_limit(0), 0)
+        self.assertEqual(gen_limits.parse_limit("64"), 64)
+        for bad in (-2, "abc", None, True, 1.5j):
+            with self.assertRaises(ValueError):
+                gen_limits.parse_limit(bad)
+
+    def test_max_tokens_arg(self) -> None:
+        import argparse
+
+        self.assertEqual(gen_limits.max_tokens_arg("-1"), -1)
+        self.assertEqual(gen_limits.max_tokens_arg("4096"), 4096)
+        for bad in ("-5", "x"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                gen_limits.max_tokens_arg(bad)
+
+    def test_requested_limit_default_unlimited(self) -> None:
+        self.assertIsNone(gen_limits.requested_limit({}, CHAT_MAX_KEYS, None))
+        self.assertIsNone(gen_limits.requested_limit({"max_tokens": None}, CHAT_MAX_KEYS, None))
+        self.assertEqual(gen_limits.requested_limit({}, CHAT_MAX_KEYS, 4096), 4096)
+
+    def test_request_overrides_default(self) -> None:
+        self.assertEqual(gen_limits.requested_limit({"max_tokens": 64}, CHAT_MAX_KEYS, None), 64)
+        self.assertEqual(gen_limits.requested_limit({"max_tokens": 64}, CHAT_MAX_KEYS, 4096), 64)
+        self.assertEqual(gen_limits.requested_limit({"max_tokens": 0}, CHAT_MAX_KEYS, 4096), 0)
+        self.assertIsNone(gen_limits.requested_limit({"max_tokens": -1}, CHAT_MAX_KEYS, 4096))
+        with self.assertRaises(ValueError):
+            gen_limits.requested_limit({"max_tokens": -3}, CHAT_MAX_KEYS, None)
+
+    def test_field_order(self) -> None:
+        both = {"max_tokens": 10, "max_completion_tokens": 20, "max_output_tokens": 30}
+        self.assertEqual(gen_limits.requested_limit(both, CHAT_MAX_KEYS, None), 10)
+        self.assertEqual(gen_limits.requested_limit(both, RESPONSES_MAX_KEYS, None), 30)
+        self.assertEqual(
+            gen_limits.requested_limit({"max_tokens": None, "max_completion_tokens": 20}, CHAT_MAX_KEYS, None),
+            20,
+        )
+        self.assertEqual(
+            gen_limits.requested_limit({"max_tokens": 10, "max_completion_tokens": 20}, RESPONSES_MAX_KEYS, None),
+            10,
+        )
+
+    def test_effective_caps_at_remaining_context(self) -> None:
+        self.assertEqual(gen_limits.effective_max_tokens(None, 1000, 262144), 261144)
+        self.assertEqual(gen_limits.effective_max_tokens(64, 1000, 262144), 64)
+        self.assertEqual(gen_limits.effective_max_tokens(500, 900, 1000), 100)
+        self.assertEqual(gen_limits.effective_max_tokens(0, 10, 1000), 0)
+        with self.assertRaises(ValueError):
+            gen_limits.effective_max_tokens(None, 1000, 1000)
+        with self.assertRaises(ValueError):
+            gen_limits.effective_max_tokens(64, 2000, 1000)
+
+    def test_context_length_from_config(self) -> None:
+        cfg = {"text_config": {"max_position_embeddings": 262144}}
+        self.assertEqual(gen_limits.context_length_from_config(cfg), 262144)
+        self.assertEqual(gen_limits.context_length_from_config({"max_position_embeddings": 8192}), 8192)
+        self.assertEqual(gen_limits.context_length_from_config({}, 131072), 131072)
+        # HF tokenizers use a huge sentinel when no limit is set
+        self.assertEqual(
+            gen_limits.context_length_from_config(None, int(1e30)), gen_limits.FALLBACK_CONTEXT_LENGTH
+        )
+
+    def test_server_default_is_unlimited(self) -> None:
+        src = (Path(__file__).resolve().parent / "server.py").read_text(encoding="utf-8")
+        self.assertIn("DEFAULT_MAX_TOKENS = gen_limits.UNLIMITED", src)
+        self.assertIn("type=gen_limits.max_tokens_arg", src)
+        self.assertIn('("max_tokens", "max_completion_tokens")', src)
+        self.assertIn('("max_output_tokens", "max_tokens", "max_completion_tokens")', src)
+        self.assertEqual(src.count("gen_limits.effective_max_tokens("), 2)
 
 
 if __name__ == "__main__":

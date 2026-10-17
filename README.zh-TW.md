@@ -62,7 +62,7 @@ cd mlx-qwen38
 kill -TERM <server pid>
 ```
 
-其他參數：`--budget-gb`、`--model-path`（或環境變數 `QWEN38_MODEL`）、`--model-id`、`--max-rss-gb`、`--max-swap-growth-gb`。以 `kill -TERM` 停止。
+其他參數：`--max-tokens`（請求未指定時的預設輸出上限；預設 `-1` = 不限制，與 llama.cpp、Ollama 相同：生成到 EOS／stop 字串或 context 用完為止；設為 `N` 則固定上限）、`--budget-gb`、`--model-path`（或環境變數 `QWEN38_MODEL`）、`--model-id`、`--max-rss-gb`、`--max-swap-growth-gb`。以 `kill -TERM` 停止。
 
 端點：
 - `GET /health`、`GET /v1/models`
@@ -70,7 +70,7 @@ kill -TERM <server pid>
 - `POST /v1/completions`
 - `POST /v1/responses`（OpenAI Responses API；串流與非串流）。支援 function 工具呼叫（見英文 README 的 Tool calling 一節）；`previous_response_id` 或圖片輸入會回傳 HTTP 400。
 
-參數：`max_tokens` / `max_completion_tokens` / `max_output_tokens`（預設 4096，可用 `--max-tokens` 調整）、`temperature`（0 = 貪婪解碼）、`top_p`、`stop`、`stream`、`seed`、`enable_thinking`（預設 false）。回應包含 `usage` 與 `timings`。
+參數：`max_tokens` / `max_completion_tokens` / `max_output_tokens`（預設不限制，上限為剩餘的 context；請求中的值（`-1` 表示不限制）優先於 `--max-tokens`）、`temperature`（0 = 貪婪解碼）、`top_p`、`stop`、`stream`、`seed`、`enable_thinking`（預設 false）。回應包含 `usage` 與 `timings`。
 
 ```bash
 curl -s http://127.0.0.1:8090/health

@@ -37,9 +37,12 @@ if _THIS_DIR not in sys.path:
 import loader  # noqa: E402  (sets sys.path and mx.set_cache_limit(2GB))
 import mlx.core as mx  # noqa: E402
 import tool_calls  # noqa: E402
+import gen_limits  # noqa: E402
 
 GEN_LOCK = threading.Lock()
-DEFAULT_MAX_TOKENS = 4096  # overridable with --max-tokens
+# -1 = unlimited (like llama.cpp / Ollama): stop at EOS or when the context is full.
+# Overridable with --max-tokens; a limit in the request takes precedence.
+DEFAULT_MAX_TOKENS = gen_limits.UNLIMITED
 
 
 def get_stop_token_ids(engine: loader.OffloadEngine) -> set[int]:
@@ -413,6 +416,15 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
 
         self._send_error_json(404, f"Unknown endpoint: {path}", "not_found_error")
 
+    def _default_max_limit(self) -> int | None:
+        """Server default output limit (--max-tokens); None = unlimited."""
+        return gen_limits.parse_limit(
+            getattr(self.server, "default_max_tokens", DEFAULT_MAX_TOKENS), "--max-tokens"
+        )
+
+    def _context_length(self) -> int:
+        return int(getattr(self.server, "context_length", gen_limits.FALLBACK_CONTEXT_LENGTH))
+
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path not in ("/v1/chat/completions", "/v1/completions", "/v1/responses"):
@@ -428,13 +440,11 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
             is_chat = path == "/v1/chat/completions"
             engine = self.server.engine
 
-            default_max = getattr(self.server, "default_max_tokens", DEFAULT_MAX_TOKENS)
-            raw_max = req.get("max_tokens")
-            if raw_max is None:
-                raw_max = req.get("max_completion_tokens")
-            max_tokens = default_max if raw_max is None else int(raw_max)
-            if max_tokens < 0:
-                raise ValueError("'max_tokens' must be non-negative")
+            # Request value wins (max_tokens, then max_completion_tokens); else --max-tokens.
+            # None = unlimited; capped at the remaining context once the prompt is encoded.
+            max_limit = gen_limits.requested_limit(
+                req, ("max_tokens", "max_completion_tokens"), self._default_max_limit()
+            )
 
             temperature = float(req.get("temperature", 0.0) or 0.0)
             top_p = float(1.0 if req.get("top_p") is None else req.get("top_p"))
@@ -469,6 +479,9 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
 
             if not prompt_ids:
                 raise ValueError("Encoded prompt produced 0 tokens")
+            max_tokens = gen_limits.effective_max_tokens(
+                max_limit, len(prompt_ids), self._context_length()
+            )
         except Exception as exc:
             self._send_error_json(400, str(exc), "invalid_request_error")
             return
@@ -520,15 +533,13 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                     norm_tools, raw_tool_choice, messages
                 )
 
-            default_max = getattr(self.server, "default_max_tokens", DEFAULT_MAX_TOKENS)
-            raw_max = None
-            for key in ("max_output_tokens", "max_tokens", "max_completion_tokens"):
-                if req.get(key) is not None:
-                    raw_max = req[key]
-                    break
-            max_output_tokens = default_max if raw_max is None else int(raw_max)
-            if max_output_tokens < 0:
-                raise ValueError("'max_output_tokens' must be non-negative")
+            # Request value wins (max_output_tokens, max_tokens, max_completion_tokens);
+            # else --max-tokens. None = unlimited, capped at the remaining context below.
+            max_limit = gen_limits.requested_limit(
+                req,
+                ("max_output_tokens", "max_tokens", "max_completion_tokens"),
+                self._default_max_limit(),
+            )
 
             temperature = float(req.get("temperature", 0.0) or 0.0)
             top_p = float(1.0 if req.get("top_p") is None else req.get("top_p"))
@@ -547,6 +558,9 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
             )
             if not prompt_ids:
                 raise ValueError("Encoded prompt produced 0 tokens")
+            max_output_tokens = gen_limits.effective_max_tokens(
+                max_limit, len(prompt_ids), self._context_length()
+            )
         except Exception as exc:
             self._send_error_json(400, str(exc), "invalid_request_error")
             return
@@ -555,6 +569,7 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
             self._handle_responses_generation(
                 prompt_ids=prompt_ids,
                 max_output_tokens=max_output_tokens,
+                requested_max_output_tokens=max_limit,
                 temperature=temperature,
                 top_p=top_p,
                 stop_strings=stop_strings,
@@ -584,6 +599,7 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
         resp_model: str,
         instructions: str | None,
         tools: list[dict[str, Any]] | None = None,
+        requested_max_output_tokens: int | None = None,
     ) -> None:
         engine = self.server.engine
         resp_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -614,7 +630,8 @@ class OffloadRequestHandler(BaseHTTPRequestHandler):
                 "error": None,
                 "incomplete_details": incomplete_details_val,
                 "instructions": instructions,
-                "max_output_tokens": max_output_tokens,
+                # The limit as requested (null = unlimited), not the context-capped value.
+                "max_output_tokens": requested_max_output_tokens,
                 "model": resp_model,
                 "output": output_list,
                 "output_text": output_text_val,
@@ -1335,7 +1352,13 @@ def main() -> None:
     parser.add_argument("--model-id", type=str, default="qwen3.8-flash-next-offload")
     parser.add_argument("--max-rss-gb", type=float, default=38.0)
     parser.add_argument("--max-swap-growth-gb", type=float, default=8.0)
-    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="Default max_tokens / max_output_tokens when a request omits them")
+    parser.add_argument(
+        "--max-tokens",
+        type=gen_limits.max_tokens_arg,
+        default=DEFAULT_MAX_TOKENS,
+        help="Default max_tokens / max_output_tokens when a request omits them; "
+        "-1 (default) = unlimited: stop at EOS or when the context is full",
+    )
     args = parser.parse_args()
 
     start_swap_mb = loader.get_swap_used_mb()
@@ -1365,6 +1388,19 @@ def main() -> None:
 
     httpd = OffloadHTTPServer((args.host, args.port), engine=engine, model_id=args.model_id)
     httpd.default_max_tokens = int(args.max_tokens)
+    try:
+        with open(Path(args.model_path) / "config.json", encoding="utf-8") as f:
+            model_config = json.load(f)
+    except (OSError, ValueError):
+        model_config = None
+    httpd.context_length = gen_limits.context_length_from_config(
+        model_config, getattr(engine.tokenizer, "model_max_length", None)
+    )
+    print(
+        f"[server] context={httpd.context_length} tokens | default max_tokens="
+        f"{'unlimited' if httpd.default_max_tokens == gen_limits.UNLIMITED else httpd.default_max_tokens}",
+        flush=True,
+    )
     print(f"[server] listening on http://{args.host}:{args.port}", flush=True)
 
     shutting_down = threading.Event()
