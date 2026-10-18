@@ -129,6 +129,30 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 
 Tested with opencode (`@ai-sdk/openai-compatible` provider, `baseURL: http://127.0.0.1:8090/v1`; run `opencode run ... < /dev/null`, or it waits on stdin) and Codex CLI (custom provider with `wire_api = "responses"`): both completed a read-a-file task via tool calls.
 
+## Web UI (`mlx-qwen38/webui/`)
+
+A lightweight local chat UI (vanilla HTML/CSS/JS, no build step, works offline) served by `server.py` itself:
+
+```bash
+cd mlx-qwen38
+./run.sh <python> -u server.py --host 127.0.0.1 --port 8095 \
+  --budget-pct 20 --alloc-mode even --prefetch on --prefetch-top-m 12 --prefetch-cap 3
+open http://127.0.0.1:8095/ui/      # also served at /
+kill -TERM <server pid>
+```
+
+Bind to `127.0.0.1` only (the server has no authentication). Pick any free port (the example avoids 11434, used by Ollama/oMLX).
+
+Features: model picker (`/v1/models`); Chat / Thinking toggle (`enable_thinking`); streaming output, with the thinking text in a collapsible block; safe Markdown; stop (aborts the request), regenerate, copy; multiple conversations kept in browser `localStorage` (rename, delete, export JSON/Markdown, clear); settings for system prompt, `max_tokens`, `temperature`, `top_p`, `seed`, `stop`; per-reply prompt/output tokens, TTFT, prefill and decode tok/s, total time; a performance panel polling `/api/status` every 2 s (RSS, MLX active/peak, swap, expert-cache hit rate, last request, sparklines of the last 30 requests); light/dark theme.
+
+Server additions used by the UI:
+- `GET /`, `GET /ui/`, `GET /ui/<file>`: static files from `webui/` (whitelisted types, no path traversal).
+- `GET /api/status`: busy flag, memory, expert-cache counters since start, last request timings, context length.
+- `GET /healthz`: alias of `/health`.
+- Thinking mode (`enable_thinking: true`, no tools): the text before `</think>` is returned as `delta.reasoning_content` (streaming) / `message.reasoning_content` (non-streaming), the rest as `content`. In greedy decoding, streaming and non-streaming returned identical text.
+
+`webui/mock_server.py` is a stdlib-only fake API on `127.0.0.1:8097` for frontend-only development. Screenshot: `mlx-qwen38/webui/_test/webui_thinking_perf.png`. The UI's feature set was modelled on the Whallm Mac app's chat window (MIT); no Whallm code is used.
+
 ## License
 
 Apache-2.0
