@@ -153,6 +153,10 @@ Server additions used by the UI:
 
 `webui/mock_server.py` is a stdlib-only fake API on `127.0.0.1:8097` for frontend-only development. Screenshot: `mlx-qwen38/webui/_test/webui_thinking_perf.png`. The UI's feature set was modelled on the Whallm Mac app's chat window (MIT); no Whallm code is used.
 
+## Experiments (not adopted)
+
+- [`mlx-qwen38/experiments/a2-hot-expert-seeding/`](mlx-qwen38/experiments/a2-hot-expert-seeding/): A2, keeping the prompt's hot experts in the expert cache after prefill. Outputs stay bit-identical, but decode speedup was 1.008× (95% CI [0.967, 1.051]), below the pre-set gate, so it is **not adopted** and not merged into `loader.py`.
+
 ## License
 
 Apache-2.0

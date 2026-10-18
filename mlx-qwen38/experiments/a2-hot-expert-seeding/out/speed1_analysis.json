@@ -1,0 +1,119 @@
+{
+ "A": "off",
+ "B": "topk:0.25",
+ "rounds": 6,
+ "long_decode": {
+  "gmean": 1.0081060226657552,
+  "ci95": [
+   0.9667469480019764,
+   1.051234508715398
+  ],
+  "per_round": [
+   1.0635947574934579,
+   0.9668830656619574,
+   1.0038566501981951,
+   0.9875663357318597,
+   1.0535291394395079,
+   0.9772430359269301
+  ]
+ },
+ "decode_tok_s": {
+  "doc6k": {
+   "ratio_gmean": 1.004964692672291,
+   "A_median": 7.308401848122503,
+   "B_median": 7.347621748366748
+  },
+  "p6k": {
+   "ratio_gmean": 1.0112571718640129,
+   "A_median": 8.733299467398712,
+   "B_median": 8.686359429794585
+  },
+  "short": {
+   "ratio_gmean": 1.0121105082175548,
+   "A_median": 9.681387343007273,
+   "B_median": 9.425842236111597
+  }
+ },
+ "ttft_s": {
+  "doc6k": {
+   "ratio_gmean": 0.9849919142207331,
+   "A_median": 53.01732856268063,
+   "B_median": 51.700265562627465
+  },
+  "p6k": {
+   "ratio_gmean": 0.9965004040983358,
+   "A_median": 31.70420866739005,
+   "B_median": 32.01103372918442
+  },
+  "short": {
+   "ratio_gmean": 1.0332871833619173,
+   "A_median": 1.3732481049373746,
+   "B_median": 1.4175781249068677
+  }
+ },
+ "request_s": {
+  "doc6k": {
+   "ratio_gmean": 0.9882868085091789,
+   "A_median": 80.3342095836997,
+   "B_median": 78.98754420876503
+  },
+  "p6k": {
+   "ratio_gmean": 0.9932010023777399,
+   "A_median": 54.40284154145047,
+   "B_median": 54.800430125091225
+  },
+  "short": {
+   "ratio_gmean": 0.9912376178893085,
+   "A_median": 21.912298479117453,
+   "B_median": 22.57941922871396
+  }
+ },
+ "hit_rate": {
+  "doc6k": {
+   "ratio_gmean": 1.0023198409251937,
+   "A_median": 0.935592857906554,
+   "B_median": 0.9377632845076446
+  },
+  "p6k": {
+   "ratio_gmean": 1.0002613903694695,
+   "A_median": 0.9407783598845291,
+   "B_median": 0.9410242702876083
+  },
+  "short": {
+   "ratio_gmean": 0.9997756615180985,
+   "A_median": 0.9531807976050465,
+   "B_median": 0.9529669624719341
+  }
+ },
+ "seed_loaded_experts_median": {
+  "doc6k": 924.0,
+  "p6k": 582.0,
+  "short": 53.0
+ },
+ "seed_s_median": {
+  "doc6k": 0.8295397721230984,
+  "p6k": 0.7771743144840002,
+  "short": 0.2830013372004032
+ },
+ "swap_growth_mb_max": 0.0,
+ "page_resident_before": {
+  "off": [
+   0.593,
+   0.7471
+  ],
+  "topk:0.25": [
+   0.5933,
+   0.7555
+  ]
+ },
+ "tokens_identical_A_vs_B": true,
+ "gates": {
+  "long_decode_gmean>=1.05": false,
+  "long_decode_ci_low>1": false,
+  "each_prompt_decode>=0.95": true,
+  "ttft_ratio<=1.05": true,
+  "long_request_ratio<=1.0": true,
+  "no_swap_growth": true
+ },
+ "PASS": false
+}
