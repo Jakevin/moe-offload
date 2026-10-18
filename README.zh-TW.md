@@ -85,6 +85,30 @@ curl -s http://127.0.0.1:8090/v1/responses -H 'Content-Type: application/json' \
 
 實測（Mac mini M4 Pro）：暖機後解碼約 10.2–10.7 tok/s；`temperature: 0` 的輸出與直接執行 `loader.py` 完全相同。
 
+## Web UI（`mlx-qwen38/webui/`）
+
+輕量的本機聊天介面（原生 HTML/CSS/JS，不需要建置步驟，可離線使用），直接由 `server.py` 提供：
+
+```bash
+cd mlx-qwen38
+./run.sh <python> -u server.py --host 127.0.0.1 --port 8095 \
+  --budget-pct 20 --alloc-mode even --prefetch on --prefetch-top-m 12 --prefetch-cap 3
+open http://127.0.0.1:8095/ui/      # 也可以從 / 開啟
+kill -TERM <server pid>
+```
+
+只綁定 `127.0.0.1`（伺服器沒有驗證機制）。可以使用任何空閒的連接埠（範例避開了 Ollama/oMLX 使用的 11434）。
+
+功能：模型選單（`/v1/models`）；Chat / Thinking 模式切換（`enable_thinking`）；串流輸出，思考內容放在可收合的區塊；安全的 Markdown 顯示；停止（中斷請求）、重新產生、複製；多個對話存在瀏覽器的 `localStorage`（重新命名、刪除、匯出 JSON/Markdown、清除）；可設定 system prompt、`max_tokens`、`temperature`、`top_p`、`seed`、`stop`；每則回覆顯示 prompt/輸出 token 數、TTFT（首個 token 延遲）、prefill 與 decode 的 tok/s、總耗時；效能面板每 2 秒輪詢 `/api/status`（RSS、MLX active/peak、swap、專家快取命中率、上一次請求、最近 30 次請求的走勢小圖）；淺色/深色主題。
+
+介面用到的伺服器新增功能：
+- `GET /`、`GET /ui/`、`GET /ui/<file>`：提供 `webui/` 裡的靜態檔案（白名單檔案類型，禁止路徑穿越）。
+- `GET /api/status`：忙碌狀態、記憶體、啟動以來的專家快取計數、上一次請求的耗時、上下文長度。
+- `GET /healthz`：`/health` 的別名。
+- Thinking 模式（`enable_thinking: true`，且未使用工具）：`</think>` 之前的文字以 `delta.reasoning_content`（串流）/ `message.reasoning_content`（非串流）回傳，其餘放在 `content`。在 greedy 解碼下，串流與非串流回傳的文字完全相同。
+
+`webui/mock_server.py` 是只用標準函式庫寫成的假 API（`127.0.0.1:8097`），供單獨開發前端時使用。截圖：`mlx-qwen38/webui/_test/webui_thinking_perf.png`。介面的功能參考了 Whallm Mac App 的聊天視窗（MIT 授權）；沒有使用任何 Whallm 的程式碼。
+
 ## 授權
 
 Apache-2.0
