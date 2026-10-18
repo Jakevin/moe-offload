@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Qwen MoE Loader 本地推理介面</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <div id="offlineBanner" class="offline-banner hidden" role="alert" aria-live="assertive">
+    <span class="offline-icon" aria-hidden="true">⚠</span>
+    <span id="offlineText">伺服器未連線</span>
+    <button type="button" id="retryConnBtn" class="btn btn-small" aria-label="重新連線至伺服器">重試</button>
+  </div>
+
+  <header class="toolbar" role="banner">
+    <div class="toolbar-left">
+      <button type="button" id="toggleSidebarBtn" class="btn btn-icon" aria-label="切換對話列表側欄" title="切換對話列表">
+        ☰
+      </button>
+      <h1 class="app-title">MoE Loader WebUI</h1>
+      <div class="model-picker-wrap">
+        <label for="modelSelect" class="sr-only">選擇模型</label>
+        <select id="modelSelect" aria-label="選擇模型" title="選擇推理模型">
+          <option value="">載入模型中…</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="toolbar-center">
+      <div class="mode-switch" role="group" aria-label="對話與思考模式切換">
+        <button type="button" id="modeChatBtn" class="mode-btn" aria-pressed="false">
+          一般對話 (Chat)
+        </button>
+        <button type="button" id="modeThinkBtn" class="mode-btn active" aria-pressed="true">
+          思考模式 (Thinking)
+        </button>
+      </div>
+
+      <div class="live-metric" aria-live="polite" title="即時 Decode 速度">
+        <span class="metric-label">Decode</span>
+        <strong id="liveDecodeTps" class="metric-value">—</strong>
+        <span class="metric-unit">tok/s</span>
+      </div>
+
+      <div id="busyIndicator" class="busy-badge idle" role="status" aria-live="polite">
+        <span class="busy-dot"></span>
+        <span id="busyText">閒置</span>
+      </div>
+    </div>
+
+    <div class="toolbar-right">
+      <button type="button" id="toggleSettingsBtn" class="btn btn-secondary" aria-expanded="false" aria-controls="settingsDrawer">
+        ⚙ 參數設定
+      </button>
+      <button type="button" id="togglePerfBtn" class="btn btn-secondary" aria-expanded="true" aria-controls="perfPanel">
+        📊 效能監控
+      </button>
+      <button type="button" id="themeToggleBtn" class="btn btn-icon" aria-label="切換深淺色主題" title="切換深色 / 淺色主題">
+        🌓
+      </button>
+    </div>
+  </header>
+
+  <div class="app-layout">
+    <!-- Left Sidebar: Conversations -->
+    <aside id="convSidebar" class="sidebar" aria-label="對話紀錄列表">
+      <div class="sidebar-header">
+        <button type="button" id="newConvBtn" class="btn btn-primary btn-block" aria-label="建立新對話">
+          ＋ 新增對話
+        </button>
+      </div>
+
+      <ul id="convList" class="conv-list" role="listbox" aria-label="歷史對話"></ul>
+
+      <div class="sidebar-footer">
+        <div class="export-group">
+          <button type="button" id="exportJsonBtn" class="btn btn-small" title="匯出目前對話為 JSON">匯出 JSON</button>
+          <button type="button" id="exportMdBtn" class="btn btn-small" title="匯出目前對話為 Markdown">匯出 MD</button>
+        </div>
+        <button type="button" id="clearChatBtn" class="btn btn-small btn-danger" title="清空目前對話訊息">
+          清空對話
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Chat Area -->
+    <main class="chat-main" role="main">
+      <div id="inlineErrorBox" class="inline-error hidden" role="alert">
+        <div class="inline-error-content">
+          <strong>請求發生錯誤：</strong>
+          <span id="inlineErrorMsg"></span>
+        </div>
+        <button type="button" id="dismissErrorBtn" class="btn btn-small" aria-label="關閉錯誤訊息">關閉</button>
+      </div>
+
+      <div id="messagesContainer" class="messages-container" aria-live="polite" aria-label="訊息內容區">
+        <div id="emptyState" class="empty-state">
+          <h2>歡迎使用本地 MoE 推理介面</h2>
+          <p>支援即時 SSE 串流、<code>reasoning_content</code> 思考過程摺疊、專家快取 (Expert Cache) 監控與本機對話紀錄。</p>
+        </div>
+      </div>
+
+      <footer class="composer-area">
+        <form id="chatForm" class="composer-form">
+          <label for="userInput" class="sr-only">輸入訊息</label>
+          <textarea
+            id="userInput"
+            rows="3"
+            placeholder="輸入訊息… (Enter 發送，Shift+Enter 換行)"
+            aria-label="輸入訊息"
+          ></textarea>
+          <div class="composer-actions">
+            <div class="composer-hint">
+              <span id="modeStatusHint">目前模式：思考模式 (enable_thinking: true)</span>
+            </div>
+            <div class="composer-buttons">
+              <button type="button" id="regenBtn" class="btn btn-secondary" title="重新生成最後一則回覆" aria-label="重新生成最後一則回覆">
+                ↻ 重新生成
+              </button>
+              <button type="button" id="stopBtn" class="btn btn-danger hidden" aria-label="停止生成">
+                ■ 停止生成
+              </button>
+              <button type="submit" id="sendBtn" class="btn btn-primary" aria-label="發送訊息">
+                發送 ➤
+              </button>
+            </div>
+          </div>
+        </form>
+      </footer>
+    </main>
+
+    <!-- Settings Panel Drawer -->
+    <aside id="settingsDrawer" class="side-panel hidden" aria-label="推論參數設定">
+      <div class="panel-header">
+        <h2>推論參數設定</h2>
+        <button type="button" id="closeSettingsBtn" class="btn btn-icon" aria-label="關閉參數設定">✕</button>
+      </div>
+      <div class="panel-body">
+        <div class="form-group">
+          <label for="settingSystemPrompt">系統提示詞 (System Prompt)</label>
+          <textarea id="settingSystemPrompt" rows="4" placeholder="例如：你是一位專業的繁體中文 AI 助理。"></textarea>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="settingMaxTokens">Max Tokens</label>
+            <input type="number" id="settingMaxTokens" min="1" max="32768" step="1" value="1024">
+          </div>
+          <div class="form-group">
+            <label for="settingTemperature">Temperature</label>
+            <input type="number" id="settingTemperature" min="0" max="2" step="0.05" value="0.7">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="settingTopP">Top P</label>
+            <input type="number" id="settingTopP" min="0" max="1" step="0.05" value="0.9">
+          </div>
+          <div class="form-group">
+            <label for="settingSeed">Seed (空白=不指定)</label>
+            <input type="number" id="settingSeed" step="1" placeholder="隨機">
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="settingStop">停止詞 Stop Strings (以逗號分隔)</label>
+          <input type="text" id="settingStop" placeholder="例如：<|im_end|>, </tool_call>">
+        </div>
+        <div class="panel-actions">
+          <button type="button" id="resetSettingsBtn" class="btn btn-secondary btn-small">恢復預設值</button>
+          <span id="settingsSavedHint" class="saved-hint" aria-live="polite">已自動儲存</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Performance Panel -->
+    <aside id="perfPanel" class="side-panel" aria-label="效能與記憶體監控面板">
+      <div class="panel-header">
+        <h2>效能監控 (每 2 秒更新)</h2>
+        <button type="button" id="closePerfBtn" class="btn btn-icon" aria-label="關閉效能監控">✕</button>
+      </div>
+      <div class="panel-body">
+        <section class="perf-section" aria-labelledby="perfMemHeading">
+          <h3 id="perfMemHeading">記憶體與系統狀態</h3>
+          <div class="stat-grid">
+            <div class="stat-card">
+              <span class="stat-label">RSS 記憶體</span>
+              <strong id="statRss" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">MLX Active</span>
+              <strong id="statMlxActive" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">MLX Peak</span>
+              <strong id="statMlxPeak" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">Swap 使用量</span>
+              <strong id="statSwap" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">Context 長度</span>
+              <strong id="statCtxLen" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">伺服器狀態</span>
+              <strong id="statServerBusy" class="stat-val">—</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="perf-section" aria-labelledby="perfCacheHeading">
+          <h3 id="perfCacheHeading">Expert Cache 統計 (啟動至今)</h3>
+          <div class="stat-grid">
+            <div class="stat-card highlight">
+              <span class="stat-label">Cache Hit Rate</span>
+              <strong id="statHitRate" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">Decode Requests</span>
+              <strong id="statDecodeReqs" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">Demand Misses</span>
+              <strong id="statDemandMisses" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">Demand Read</span>
+              <strong id="statDemandBytes" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">Prefetch Read</span>
+              <strong id="statPrefetchBytes" class="stat-val">—</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="perf-section" aria-labelledby="perfLastReqHeading">
+          <h3 id="perfLastReqHeading">最近一次請求 (Last Request)</h3>
+          <div class="stat-grid">
+            <div class="stat-card">
+              <span class="stat-label">Prompt / Output</span>
+              <strong id="statLastTokens" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">Prefill 速度</span>
+              <strong id="statLastPrefill" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">Decode 速度</span>
+              <strong id="statLastDecode" class="stat-val">—</strong>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">總耗時 / 結束原因</span>
+              <strong id="statLastTime" class="stat-val">—</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="perf-section" aria-labelledby="perfSparkHeading">
+          <div class="spark-header-row">
+            <h3 id="perfSparkHeading">最近 30 次推論速度趨勢</h3>
+            <button type="button" id="clearPerfHistoryBtn" class="btn btn-small" aria-label="清除推論速度歷史紀錄">
+              清除紀錄
+            </button>
+          </div>
+
+          <div class="sparkline-box">
+            <div class="sparkline-meta">
+              <span>Decode tok/s</span>
+              <strong id="sparkDecodeSummary">—</strong>
+            </div>
+            <svg id="sparkDecodeSvg" class="sparkline-svg" viewBox="0 0 260 56" role="img" aria-label="Decode tok/s 趨勢圖"></svg>
+          </div>
+
+          <div class="sparkline-box">
+            <div class="sparkline-meta">
+              <span>Prefill tok/s</span>
+              <strong id="sparkPrefillSummary">—</strong>
+            </div>
+            <svg id="sparkPrefillSvg" class="sparkline-svg" viewBox="0 0 260 56" role="img" aria-label="Prefill tok/s 趨勢圖"></svg>
+          </div>
+        </section>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Confirmation / Rename Modal -->
+  <div id="modalOverlay" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-card">
+      <h3 id="modalTitle">確認操作</h3>
+      <p id="modalMessage"></p>
+      <input type="text" id="modalInput" class="modal-input hidden" aria-label="輸入對話名稱">
+      <div class="modal-actions">
+        <button type="button" id="modalCancelBtn" class="btn btn-secondary">取消</button>
+        <button type="button" id="modalConfirmBtn" class="btn btn-primary">確定</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/ui/app.js" defer></script>
+</body>
+</html>

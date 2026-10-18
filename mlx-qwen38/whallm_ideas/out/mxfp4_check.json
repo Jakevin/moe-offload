@@ -1,0 +1,65 @@
+{
+ "mlx": "0.32.4",
+ "gather_wiring": {
+  "a2": {
+   "out_shape_ok": true,
+   "max_abs_diff": 0.0,
+   "ref_max_abs": 3.890625,
+   "nan_inf": false
+  },
+  "a4": {
+   "out_shape_ok": true,
+   "max_abs_diff": 0.0,
+   "ref_max_abs": 4.53125,
+   "nan_inf": false
+  },
+  "mx4": {
+   "out_shape_ok": true,
+   "max_abs_diff": 0.0,
+   "ref_max_abs": 4.0,
+   "nan_inf": false
+  }
+ },
+ "bytes_per_expert": {
+  "a2": 1536000,
+  "a4": 2764800,
+  "mx4": 2611200
+ },
+ "roundtrip_equal": {
+  "a2": true,
+  "a4": true,
+  "mx4": true
+ },
+ "whallm_vs_mlx": {
+  "edge": {
+   "groups": 8,
+   "scale_equal_frac": 0.875,
+   "code_equal_frac": 0.93359375,
+   "value_equal_frac": 0.99609375,
+   "mlx_dequant_matches_my_decoder": false,
+   "first_mismatch_rows": [
+    1,
+    7
+   ]
+  },
+  "random": {
+   "groups": 512,
+   "scale_equal_frac": 0.673828125,
+   "code_equal_frac": 0.71234130859375,
+   "value_equal_frac": 0.9151611328125,
+   "mlx_dequant_matches_my_decoder": true,
+   "first_mismatch_rows": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+   ]
+  }
+ }
+}
