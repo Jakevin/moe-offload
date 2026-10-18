@@ -109,6 +109,10 @@ kill -TERM <server pid>
 
 `webui/mock_server.py` 是只用標準函式庫寫成的假 API（`127.0.0.1:8097`），供單獨開發前端時使用。截圖：`mlx-qwen38/webui/_test/webui_thinking_perf.png`。介面的功能參考了 Whallm Mac App 的聊天視窗（MIT 授權）；沒有使用任何 Whallm 的程式碼。
 
+## Experiments (not adopted)
+
+- [`mlx-qwen38/experiments/a2-hot-expert-seeding/`](mlx-qwen38/experiments/a2-hot-expert-seeding/)：A2，prefill 後把該提示的熱門專家留在專家快取。輸出逐位元一致，但 decode 加速只有 1.008×（95% CI [0.967, 1.051]），未達預設門檻，因此**未採用（not adopted）**，沒有併入 `loader.py`。
+
 ## 授權
 
 Apache-2.0
