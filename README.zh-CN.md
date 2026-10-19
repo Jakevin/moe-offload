@@ -11,6 +11,7 @@
 | 路径 | 说明 |
 |---|---|
 | `mlx-qwen38/` | Qwen3.8-Flash-Next（MLX GSQ-RCO Q2 重新打包）的 MLX 加载器：`loader.py`、`bench.py`、`profile_run.py`、`server.py`（OpenAI 兼容服务器）、`run.sh`（RSS／swap 监控程序）、`expert_io.c`（原生 pthread pread 线程池，通过 ctypes 加载） |
+| `mlx-qwen38/cpp/` | C++ 运行器（用 MLX C++ 移植 decode 路径），与 Python 加载器逐位一致；见 [`mlx-qwen38/cpp/README.md`](mlx-qwen38/cpp/README.md) |
 | `mlx-qwen38/trace/` | 路由追踪器与分析（逐层 LRU 命中模拟、下一层路由器预测召回率） |
 | `llamacpp-bolt/` | 用于 NVIDIA Nemotron 3.5 Bolt 74B-A9B GGUF 的 llama.cpp 专家缓存：`llama-moe-cache.patch`、`moe_loader.cpp`、`route_trace.cpp`、`analyze_routes.py`、`bench.py` |
 
@@ -108,6 +109,18 @@ kill -TERM <server pid>
 - Thinking 模式（`enable_thinking: true`，且未使用工具）：`</think>` 之前的文本以 `delta.reasoning_content`（流式）/ `message.reasoning_content`（非流式）返回，其余放在 `content`。在 greedy 解码下，流式与非流式返回的文本完全一致。
 
 `webui/mock_server.py` 是只用标准库编写的模拟 API（`127.0.0.1:8097`），用于单独开发前端。截图：`mlx-qwen38/webui/_test/webui_thinking_perf.png`。界面的功能参考了 Whallm Mac App 的聊天窗口（MIT 许可证）；没有使用任何 Whallm 的代码。
+
+## C++ 运行器（`mlx-qwen38/cpp/`）
+
+用 MLX C++ API 移植的 decode 路径，沿用相同的 SSD 专家卸载。构建与测试：
+
+```bash
+cd mlx-qwen38/cpp && cmake -S . -B build && cmake --build build -j
+./build/test_budget && ./build/test_io_sched && ./build/test_kernels   # 先运行 tests/gen_fixtures_v2.py
+QWEN38_MODEL=/path/to/model ./build/qwen38_decode --ids prompts.json --prompt-index 0 --n 128 --io exact --budget fixed --out out/run.json
+```
+
+逐位一致验证（Mac mini M4 Pro 64 GB，4 个提示 × 128 token，专家缓存 20%）：token id、每一步的 logits（原始位）与最终缓存状态（122/122 个张量）都与 Python MLX 加载器完全相同。decode 9.0–9.6 tok/s，峰值 RSS 约 11.5 GB。P1 I/O 调度、强制 miss 压力测试与 auto 内存预算也都逐位一致。目前只有 dense attention，总长度须 ≤ 2048 token。详见 [`mlx-qwen38/cpp/README.md`](mlx-qwen38/cpp/README.md)（英文）。
 
 ## Experiments (not adopted)
 

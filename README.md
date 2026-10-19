@@ -11,6 +11,7 @@ This is research code. It was tested only on the models and machines listed belo
 | Path | What |
 |---|---|
 | `mlx-qwen38/` | MLX loader for Qwen3.8-Flash-Next (MLX GSQ-RCO Q2 repack): `loader.py`, `bench.py`, `profile_run.py`, `server.py` (OpenAI-compatible server), `run.sh` (RSS/swap watchdog), `expert_io.c` (native pthread pread pool, loaded via ctypes) |
+| `mlx-qwen38/cpp/` | C++ runner (MLX C++ port of the decode path), bit-exact vs the Python loader; see [`mlx-qwen38/cpp/README.md`](mlx-qwen38/cpp/README.md) |
 | `mlx-qwen38/trace/` | Routing tracer + analysis (per-layer LRU hit simulation, next-layer router prediction recall) |
 | `llamacpp-bolt/` | llama.cpp expert cache for NVIDIA Nemotron 3.5 Bolt 74B-A9B GGUF: `llama-moe-cache.patch`, `moe_loader.cpp`, `route_trace.cpp`, `analyze_routes.py`, `bench.py` |
 
@@ -152,6 +153,18 @@ Server additions used by the UI:
 - Thinking mode (`enable_thinking: true`, no tools): the text before `</think>` is returned as `delta.reasoning_content` (streaming) / `message.reasoning_content` (non-streaming), the rest as `content`. In greedy decoding, streaming and non-streaming returned identical text.
 
 `webui/mock_server.py` is a stdlib-only fake API on `127.0.0.1:8097` for frontend-only development. Screenshot: `mlx-qwen38/webui/_test/webui_thinking_perf.png`. The UI's feature set was modelled on the Whallm Mac app's chat window (MIT); no Whallm code is used.
+
+## C++ runner (`mlx-qwen38/cpp/`)
+
+A C++ port of the decode path on the MLX C++ API, with the same SSD expert offload. Build and test:
+
+```bash
+cd mlx-qwen38/cpp && cmake -S . -B build && cmake --build build -j
+./build/test_budget && ./build/test_io_sched && ./build/test_kernels   # run tests/gen_fixtures_v2.py first
+QWEN38_MODEL=/path/to/model ./build/qwen38_decode --ids prompts.json --prompt-index 0 --n 128 --io exact --budget fixed --out out/run.json
+```
+
+Bit-exact gate (Mac mini M4 Pro 64 GB, 4 prompts × 128 tokens, 20% expert cache): token ids, every step's logits (raw bits) and the final cache state (122/122 tensors) are identical to the Python MLX loader. Decode is 9.0–9.6 tok/s at about 11.5 GB peak RSS. The P1 I/O scheduler, forced-miss stress and auto memory budget are also bit-identical. Dense attention only, so total length must be ≤ 2048 tokens. Details: [`mlx-qwen38/cpp/README.md`](mlx-qwen38/cpp/README.md).
 
 ## Experiments (not adopted)
 
