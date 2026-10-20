@@ -170,6 +170,14 @@ Bit-exact gate (Mac mini M4 Pro 64 GB, 4 prompts × 128 tokens, 20% expert cache
 
 - [`mlx-qwen38/experiments/a2-hot-expert-seeding/`](mlx-qwen38/experiments/a2-hot-expert-seeding/): A2, keeping the prompt's hot experts in the expert cache after prefill. Outputs stay bit-identical, but decode speedup was 1.008× (95% CI [0.967, 1.051]), below the pre-set gate, so it is **not adopted** and not merged into `loader.py`.
 
+## Fixed bugs
+
+- **k_hdr prefill bug (fixed 2026-10-20, v0.4.1).** In multi-chunk MoE prefill (a layer's prompt touches more distinct experts than its expert-cache slots), the sorted `gather_qmm` fast path passed only the first `k_hdr = max(1, min(slots, max(rows, 16) // 4))` cache slots to the kernel, where `rows` is the chunk's row count, while the chunk's rows can use any slot `0..n_chunk-1`. Any chunk with `n_chunk > k_hdr` was affected, whichever chunk it is and whatever the prompt length; in practice mostly chunks with few rows relative to their experts, e.g. the trailing chunks of short/medium multi-chunk prompts. Single-chunk prefill is unchanged.
+  - **MLX 0.32.4:** rows routed to a slot `>= k_hdr` came out wrong (e.g. 16 of 63 rows in a 63-row/19-expert test chunk).
+  - **MLX 0.32.2** (oMLX's bundled build): our fixture tests showed no significant numerical errors, but the old outputs were not bit-identical to the unsorted kernel.
+  - Fix: take the sorted path only when `n_chunk <= k_hdr`, else use the unsorted kernel over all slots ([`mlx-qwen38/prefill_qproj.py`](mlx-qwen38/prefill_qproj.py); C++ [`mlx-qwen38/cpp/src/prefill_qproj.hpp`](mlx-qwen38/cpp/src/prefill_qproj.hpp)). The decode kernels are unchanged, but since prefill output changes for affected prompts, the resulting state and generated tokens can change too.
+  - Tests (random weights, no model): `cd mlx-qwen38 && python test_prefill_qproj.py` (`--old` runs the pre-fix logic and must fail; `MLX_EXPECT=0.32.4` asserts the MLX version) and `./build/test_prefill_qproj [--old]` in `mlx-qwen38/cpp`. Tested: Python on MLX 0.32.4 and 0.32.2, C++ on MLX 0.32.2 (the C++ build links oMLX's MLX). Not yet done for this version: a full-model end-to-end run of the public loader, so the bit-exact results above were measured before this fix and do not carry over. `test_kernels` also still needs the lm_head fixture from `tests/gen_fixtures_v2.py`, as before.
+
 ## License
 
 Apache-2.0

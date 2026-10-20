@@ -1,5 +1,6 @@
 #include "model.hpp"
 #include "expert_io.h"
+#include "prefill_qproj.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -463,45 +464,9 @@ mx::array Qwen38Engine::run_moe_prefill(
                                  const mx::array& s,
                                  const mx::array& b,
                                  const mx::array& x_in,
-                                 const mx::array& idx_in) -> mx::array {
-        if (use_sorted) {
-            int orig_n = x_in.shape(0);
-            mx::array x_use = x_in;
-            mx::array idx_use = idx_in;
-            if (orig_n < 16) {
-                int pad_n = 16 - orig_n;
-                mx::Shape x_start(x_in.ndim(), 0);
-                x_start[0] = orig_n - 1;
-                mx::Shape x_stop = x_in.shape();
-                auto last_x = mx::slice(x_in, x_start, x_stop);
-                std::vector<mx::array> x_cat = {x_in};
-                for (int p = 0; p < pad_n; ++p) x_cat.push_back(last_x);
-                x_use = mx::concatenate(x_cat, 0);
-
-                auto last_i = mx::slice(idx_in, {orig_n - 1}, {orig_n});
-                std::vector<mx::array> i_cat = {idx_in};
-                for (int p = 0; p < pad_n; ++p) i_cat.push_back(last_i);
-                idx_use = mx::concatenate(i_cat, 0);
-            }
-            int k_hdr = std::max(1, std::min(static_cast<int>(w.shape(0)), static_cast<int>(x_use.shape(0)) / 4));
-            auto slice_hdr = [&](const mx::array& arr) {
-                mx::Shape stop = arr.shape();
-                stop[0] = k_hdr;
-                return mx::slice(arr, mx::Shape(arr.ndim(), 0), stop);
-            };
-            auto out = mx::gather_qmm(
-                x_use, slice_hdr(w), slice_hdr(s), slice_hdr(b),
-                std::nullopt, idx_use, true, c.group_size, c.bits, "affine", true);
-            if (orig_n < 16) {
-                mx::Shape o_stop = out.shape();
-                o_stop[0] = orig_n;
-                out = mx::slice(out, mx::Shape(out.ndim(), 0), o_stop);
-            }
-            return out;
-        }
-        return mx::gather_qmm(
-            x_in, w, s, b, std::nullopt, idx_in,
-            true, c.group_size, c.bits, "affine", false);
+                                 const mx::array& idx_in,
+                                 int n_chunk) -> mx::array {
+        return prefill_qproj(w, s, b, x_in, idx_in, use_sorted, n_chunk, c.group_size, c.bits);
     };
 
     std::vector<mx::array> y_parts;
@@ -567,10 +532,10 @@ mx::array Qwen38Engine::run_moe_prefill(
         auto local_idx = mx::array(local_idx_host.data(), {m_chunk}, mx::uint32);
         auto xc = mx::slice(x_s, {pos_start, 0, 0}, {pos_end, 1, D});
 
-        auto x_up = run_prefill_qproj(c.up_w, c.up_s, c.up_b, xc, local_idx);
-        auto x_gate = run_prefill_qproj(c.gate_w, c.gate_s, c.gate_b, xc, local_idx);
+        auto x_up = run_prefill_qproj(c.up_w, c.up_s, c.up_b, xc, local_idx, last_chunk_len);
+        auto x_gate = run_prefill_qproj(c.gate_w, c.gate_s, c.gate_b, xc, local_idx, last_chunk_len);
         auto act = swiglu_compiled_({x_gate, x_up})[0];
-        auto xo = run_prefill_qproj(c.down_w, c.down_s, c.down_b, act, local_idx);
+        auto xo = run_prefill_qproj(c.down_w, c.down_s, c.down_b, act, local_idx, last_chunk_len);
 
         if (n_uniq > cap) {
             mx::eval({xo});

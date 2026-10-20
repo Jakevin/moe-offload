@@ -22,6 +22,7 @@ python3 tests/gen_fixtures_v2.py   # writes tests/tmp/lmhead_real.safetensors (~
 ./build/test_budget                # memory-budget policy (assertions enabled even in Release)
 ./build/test_io_sched              # P1 I/O scheduler: cancel/promote, pinned slots, 250-step stress
 ./build/test_kernels               # kernel parity vs the Python modules, strict bit equality
+./build/test_prefill_qproj         # k_hdr fix for multi-chunk MoE prefill (random weights; --old must FAIL)
 ```
 
 `test_kernels` covers RMSNorm, MRoPE (real size, 2D/3D), hyper-connection kernels, PLE, GDN linear attention, full attention, the router, and a real-shape 4-bit lm_head. The fixtures are synthetic: random tensors pushed through the vendor Python modules. No model weights are included.

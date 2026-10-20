@@ -70,6 +70,8 @@ from mlx_vlm.utils import (
 )
 from transformers import AutoTokenizer
 
+from prefill_qproj import prefill_qproj
+
 MODEL_PATH = Path(os.environ.get("QWEN38_MODEL", "models/Qwen3.8-Flash-Next-GSQ-RCO-Q2-mlx"))
 PROJECT_DIR = Path(os.environ.get("MOE_WORKDIR", "."))
 LOADER_DIR = PROJECT_DIR / "loader"
@@ -612,42 +614,11 @@ class CachedSwitchGLU(nn.Module):
             ql: QuantizedSwitchLinear,
             x_in: mx.array,
             idx_in: mx.array,
+            n_chunk: int,
         ) -> mx.array:
-            if use_sorted:
-                orig_n = x_in.shape[0]
-                if orig_n < 16:
-                    pad_n = 16 - orig_n
-                    x_in = mx.concatenate(
-                        [x_in, mx.repeat(x_in[-1:], pad_n, axis=0)], axis=0
-                    )
-                    idx_in = mx.concatenate(
-                        [idx_in, mx.repeat(idx_in[-1:], pad_n, axis=0)], axis=0
-                    )
-                k_hdr = max(1, min(ql["weight"].shape[0], x_in.shape[0] // 4))
-                out = mx.gather_qmm(
-                    x_in,
-                    ql["weight"][:k_hdr],
-                    ql["scales"][:k_hdr],
-                    ql.get("biases")[:k_hdr],
-                    rhs_indices=idx_in,
-                    transpose=True,
-                    group_size=ql.group_size,
-                    bits=ql.bits,
-                    mode=ql.mode,
-                    sorted_indices=True,
-                )
-                return out[:orig_n] if orig_n < 16 else out
-            return mx.gather_qmm(
-                x_in,
-                ql["weight"],
-                ql["scales"],
-                ql.get("biases"),
-                rhs_indices=idx_in,
-                transpose=True,
-                group_size=ql.group_size,
-                bits=ql.bits,
-                mode=ql.mode,
-                sorted_indices=False,
+            return prefill_qproj(
+                ql["weight"], ql["scales"], ql.get("biases"), x_in, idx_in,
+                use_sorted, n_chunk, ql.group_size, ql.bits, ql.mode,
             )
 
         multi_chunk = n_uniq > self.capacity
@@ -685,12 +656,13 @@ class CachedSwitchGLU(nn.Module):
                 )
             )
             xc = x_s[pos_start:pos_end]
-            x_up = _run_prefill_qproj(self._slot_glu.up_proj, xc, local_idx)
-            x_gate = _run_prefill_qproj(self._slot_glu.gate_proj, xc, local_idx)
+            x_up = _run_prefill_qproj(self._slot_glu.up_proj, xc, local_idx, last_chunk_len)
+            x_gate = _run_prefill_qproj(self._slot_glu.gate_proj, xc, local_idx, last_chunk_len)
             xo = _run_prefill_qproj(
                 self._slot_glu.down_proj,
                 self._slot_glu.activation(x_up, x_gate),
                 local_idx,
+                last_chunk_len,
             )
             if multi_chunk:
                 mx.eval(xo)

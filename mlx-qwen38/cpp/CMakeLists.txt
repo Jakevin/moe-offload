@@ -42,6 +42,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kernels.cpp")
   set_target_properties(test_kernels PROPERTIES BUILD_RPATH "${MLX_ROOT}/lib" INSTALL_RPATH "${MLX_ROOT}/lib")
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prefill_qproj.cpp")
+  add_executable(test_prefill_qproj tests/test_prefill_qproj.cpp)
+  target_include_directories(test_prefill_qproj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_prefill_qproj PRIVATE mlx)
+  set_target_properties(test_prefill_qproj PROPERTIES BUILD_RPATH "${MLX_ROOT}/lib" INSTALL_RPATH "${MLX_ROOT}/lib")
+endif()
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_budget.cpp")
   add_executable(test_budget tests/test_budget.cpp)
   target_include_directories(test_budget PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
