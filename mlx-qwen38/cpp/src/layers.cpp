@@ -56,7 +56,9 @@ mx::array Qwen38Engine::run_linear_attn(
 
     mx::array conv_out = qkv;
     if (T == 1 && total_len == la.conv_kernel_size) {
-        auto w_t_f32 = mx::astype(mx::transpose(mx::squeeze(la.conv1d_weight, -1)), mx::float32);
+        auto w_t_f32 = (la.conv_weight_decode_f32.size() > 0 && la.conv_weight_decode_f32.shape(0) == la.conv_kernel_size)
+            ? la.conv_weight_decode_f32
+            : mx::astype(mx::transpose(mx::squeeze(la.conv1d_weight, -1)), mx::float32);
         auto c_dec = depthwise_conv_compiled_({conv_input, w_t_f32})[0];
         conv_out = silu_compiled_({c_dec})[0];
     } else {
@@ -75,12 +77,27 @@ mx::array Qwen38Engine::run_linear_attn(
     auto beta = gb[1];
 
     // Qwen4ExpGatedDeltaNet inherits Qwen3_5GatedDeltaNet.__call__, which passes
-    // use_kernel = not self.training. Because OffloadEngine / sup_ref never calls
-    // model.eval(), self.training is True (use_kernel=False), so gated_delta_update
-    // runs gated_delta_chunked for prefill (T > 1) and gated_delta_ops for decode (T == 1).
-    auto [y, new_state] = (T > 1 && g.ndim() == 3)
-        ? gated_delta_chunked(q_norm, k_norm, v, g, beta, cache.ssm_state)
-        : gated_delta_ops(q_norm, k_norm, v, g, beta, cache.ssm_state);
+    // use_kernel = not self.training. In K50 v3 (speed_1030b/runtime.py), model.eval()
+    // is called so self.training is False (use_kernel=True -> gated_delta_kernel_).
+    mx::array y = mx::zeros({0});
+    mx::array new_state = mx::zeros({0});
+    if (is_k50_v3_) {
+        auto outs = gated_delta_kernel_(
+            {q_norm, k_norm, v, g, beta, cache.ssm_state, mx::array(T, mx::int32)},
+            {{B, T, Hv, Dv}, cache.ssm_state.shape()},
+            {q_norm.dtype(), cache.ssm_state.dtype()},
+            {32, Dv, B * Hv},
+            {32, 4, 1},
+            {{"InT", q_norm.dtype()}, {"StT", cache.ssm_state.dtype()},
+             {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
+            std::nullopt, false, {});
+        y = outs[0];
+        new_state = outs[1];
+    } else {
+        std::tie(y, new_state) = (T > 1 && g.ndim() == 3)
+            ? gated_delta_chunked(q_norm, k_norm, v, g, beta, cache.ssm_state)
+            : gated_delta_ops(q_norm, k_norm, v, g, beta, cache.ssm_state);
+    }
     cache.ssm_state = new_state;
 
     if (dbg != nullptr) {
@@ -300,7 +317,7 @@ std::pair<mx::array, mx::array> Qwen38Engine::route_topk(
     auto all_inds = mx::argpartition(gates, -top_k, -1);
     mx::Shape start(all_inds.ndim(), 0);
     start.back() = all_inds.shape(-1) - top_k;
-    auto inds = mx::slice(all_inds, start, all_inds.shape());
+    auto inds = mx::contiguous(mx::slice(all_inds, start, all_inds.shape()));
     auto scores = mx::take_along_axis(gates, inds, -1);
     scores = scores / mx::sum(scores, -1, true);
     scores = mx::astype(scores, x.dtype());
@@ -580,6 +597,248 @@ mx::array Qwen38Engine::run_moe_prefill(
     auto y_unsorted = mx::take(y_all, inv_order, 0);
     auto y = mx::squeeze(mx::reshape(y_unsorted, {B, L, K, 1, D}), -2);
     return mx::sum(y * mx::expand_dims(scores, -1), -2) + shared_y;
+}
+
+static auto& get_k50_swiglu() {
+    static auto fn = mx::compile([](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
+        const auto& gate = inputs[0];
+        const auto& x = inputs[1];
+        return {(gate * mx::sigmoid(gate)) * x};
+    }, true);
+    return fn;
+}
+
+mx::array StackedSwitchMlp::proj_all(
+    const std::string& proj_name,
+    uint8_t proj_id,
+    const mx::array& xs,
+    const std::vector<int32_t>& route,
+    bool /*expand_x*/,
+    K50ResidentCache* cache) {
+    int routes = static_cast<int>(route.size());
+    auto& grp_map = groups.at(proj_name);
+
+    std::vector<std::string> kind_order;
+    std::unordered_map<std::string, std::vector<std::pair<int, int>>> by_kind;
+    std::vector<int> order;
+    order.reserve(routes);
+    std::vector<mx::array> ys;
+
+    for (int j = 0; j < routes; ++j) {
+        int32_t e = route[j];
+        int found_loc = -1;
+        const std::string* found_kind = nullptr;
+        for (const auto& kv : grp_map) {
+            int32_t l = kv.second.e2l[e];
+            if (l >= 0) {
+                found_loc = l;
+                found_kind = &kv.first;
+                break;
+            }
+        }
+        if (found_loc < 0) {
+            // Cold expert fallback: materialize via ResidentCache (LRU + "tern" -> "2t")
+            const auto& rec = pack->experts.at(proj_name + ":" + std::to_string(e));
+            const K50MaterializedWeight* val_ptr = nullptr;
+            K50MaterializedWeight local_val;
+            if (cache != nullptr) {
+                val_ptr = &cache->get_or_load(
+                    static_cast<uint8_t>(layer_idx),
+                    proj_id,
+                    static_cast<uint16_t>(e),
+                    *pack,
+                    rec);
+            } else {
+                local_val = pack->materialize_as_affine2(rec);
+                val_ptr = &local_val;
+            }
+            mx::array x_j = (xs.shape(0) > 1)
+                ? mx::squeeze(mx::slice(xs, {j, 0, 0}, {j + 1, xs.shape(1), xs.shape(2)}), 0)
+                : mx::squeeze(xs, 0);
+            mx::array y_j = mx::quantized_matmul(
+                x_j, val_ptr->weight, val_ptr->scales, val_ptr->biases,
+                true, val_ptr->group_size, val_ptr->bits, "affine");
+            ys.push_back(mx::expand_dims(y_j, 0));
+            order.push_back(j);
+            continue;
+        }
+        if (cache != nullptr) {
+            cache->record_hot_hit(1);
+        }
+        if (by_kind.find(*found_kind) == by_kind.end()) {
+            kind_order.push_back(*found_kind);
+        }
+        by_kind[*found_kind].push_back({j, found_loc});
+    }
+
+    for (const std::string& kind : kind_order) {
+        const auto& lst = by_kind.at(kind);
+        const auto& grp = grp_map.at(kind);
+        int n_k = static_cast<int>(lst.size());
+        std::vector<int32_t> js(n_k);
+        std::vector<uint32_t> rhs(n_k);
+        for (int m = 0; m < n_k; ++m) {
+            js[m] = lst[m].first;
+            rhs[m] = static_cast<uint32_t>(lst[m].second);
+            order.push_back(lst[m].first);
+        }
+        mx::array xi = (xs.shape(0) > 1)
+            ? mx::take(xs, mx::array(js.data(), {n_k}, mx::int32), 0)
+            : mx::broadcast_to(xs, {n_k, xs.shape(1), xs.shape(2)});
+        mx::array rhs_arr(rhs.data(), {n_k}, mx::uint32);
+        ys.push_back(mx::gather_qmm(
+            xi, grp.weights, grp.scales, grp.biases,
+            std::nullopt, rhs_arr, true, grp.group_size, grp.bits, "affine", false));
+    }
+
+    mx::array y = (ys.size() == 1) ? ys[0] : mx::concatenate(ys, 0);
+    bool is_identity = true;
+    for (int j = 0; j < routes; ++j) {
+        if (order[j] != j) {
+            is_identity = false;
+            break;
+        }
+    }
+    if (is_identity) {
+        return y;
+    }
+    std::vector<int32_t> inv(routes);
+    for (int pos = 0; pos < routes; ++pos) {
+        inv[order[pos]] = pos;
+    }
+    return mx::take(y, mx::array(inv.data(), {routes}, mx::int32), 0);
+}
+
+mx::array StackedSwitchMlp::forward(
+    const mx::array& x,
+    const mx::array& indices,
+    K50ResidentCache* cache) {
+    int B = x.shape(0);
+    int L = x.shape(1);
+    int D = x.shape(2);
+    int K = indices.shape(2);
+    auto& swiglu_fn = get_k50_swiglu();
+
+    if (B * L == 1) {
+        auto ind_c = mx::contiguous(indices);
+        mx::eval({ind_c});
+        std::vector<int32_t> route(K);
+        if (ind_c.dtype() == mx::uint32) {
+            const uint32_t* p = ind_c.data<uint32_t>();
+            for (int j = 0; j < K; ++j) route[j] = static_cast<int32_t>(p[j]);
+        } else {
+            auto ind_i32 = mx::contiguous(mx::astype(ind_c, mx::int32));
+            mx::eval({ind_i32});
+            const int32_t* p = ind_i32.data<int32_t>();
+            for (int j = 0; j < K; ++j) route[j] = p[j];
+        }
+        auto flat = mx::reshape(x, {1, D});
+        auto xs = mx::expand_dims(flat, 0);  // [1, 1, D]
+        auto u = proj_all("up_proj", 1, xs, route, false, cache);
+        auto g = proj_all("gate_proj", 0, xs, route, false, cache);
+        auto h = swiglu_fn({g, u})[0];
+        auto down = proj_all("down_proj", 2, h, route, true, cache);
+        return mx::reshape(down, {B, 1, K, D});
+    }
+
+    // Prefill (B * L > 1): per-unique-expert loop matching Python _gather_switch_call
+    int N = B * L;
+    auto flat = mx::reshape(x, {N, D});
+    auto ind_c = mx::contiguous(indices);
+    mx::eval({ind_c});
+    std::vector<int32_t> route_host(N * K);
+    if (ind_c.dtype() == mx::uint32) {
+        const uint32_t* p = ind_c.data<uint32_t>();
+        for (int i = 0; i < N * K; ++i) route_host[i] = static_cast<int32_t>(p[i]);
+    } else {
+        auto ind_i32 = mx::contiguous(mx::astype(ind_c, mx::int32));
+        mx::eval({ind_i32});
+        const int32_t* p = ind_i32.data<int32_t>();
+        for (int i = 0; i < N * K; ++i) route_host[i] = p[i];
+    }
+
+    auto proj_one = [&](const std::string& proj_name,
+                        uint8_t proj_id,
+                        const mx::array& x_sub,
+                        int32_t e) -> mx::array {
+        auto& grp_map = groups.at(proj_name);
+        for (auto& kv : grp_map) {
+            const auto& grp = kv.second;
+            int32_t loc = grp.e2l[e];
+            if (loc >= 0) {
+                if (cache != nullptr) {
+                    cache->record_hot_hit(1);
+                }
+                auto w_e = mx::squeeze(
+                    mx::slice(grp.weights, {loc, 0, 0}, {loc + 1, grp.weights.shape(1), grp.weights.shape(2)}), 0);
+                auto s_e = mx::squeeze(
+                    mx::slice(grp.scales, {loc, 0, 0}, {loc + 1, grp.scales.shape(1), grp.scales.shape(2)}), 0);
+                auto b_e = mx::squeeze(
+                    mx::slice(grp.biases, {loc, 0, 0}, {loc + 1, grp.biases.shape(1), grp.biases.shape(2)}), 0);
+                return mx::quantized_matmul(
+                    x_sub, w_e, s_e, b_e,
+                    true, grp.group_size, grp.bits, "affine");
+            }
+        }
+        const auto& rec = pack->experts.at(proj_name + ":" + std::to_string(e));
+        const K50MaterializedWeight* val_ptr = nullptr;
+        K50MaterializedWeight local_val;
+        if (cache != nullptr) {
+            val_ptr = &cache->get_or_load(
+                static_cast<uint8_t>(layer_idx),
+                proj_id,
+                static_cast<uint16_t>(e),
+                *pack,
+                rec);
+        } else {
+            local_val = pack->materialize_as_affine2(rec);
+            val_ptr = &local_val;
+        }
+        return mx::quantized_matmul(
+            x_sub, val_ptr->weight, val_ptr->scales, val_ptr->biases,
+            true, val_ptr->group_size, val_ptr->bits, "affine");
+    };
+
+    std::map<int32_t, std::vector<std::pair<int32_t, int32_t>>> by_expert;
+    for (int ti = 0; ti < N; ++ti) {
+        for (int si = 0; si < K; ++si) {
+            int32_t e = route_host[ti * K + si];
+            by_expert[e].push_back({ti, ti * K + si});
+        }
+    }
+
+    std::vector<mx::array> d_parts;
+    d_parts.reserve(by_expert.size());
+    std::vector<int32_t> perm;
+    perm.reserve(N * K);
+
+    for (auto& kv : by_expert) {
+        int32_t e = kv.first;
+        const auto& pairs = kv.second;
+        int m = static_cast<int>(pairs.size());
+        std::vector<int32_t> tis(m);
+        for (int j = 0; j < m; ++j) {
+            tis[j] = pairs[j].first;
+            perm.push_back(pairs[j].second);
+        }
+        auto ti_arr = mx::array(tis.data(), {m}, mx::int32);
+        auto t = mx::take(flat, ti_arr, 0);
+        auto u = proj_one("up_proj", 1, t, e);
+        auto g = proj_one("gate_proj", 0, t, e);
+        auto h = swiglu_fn({g, u})[0];
+        auto d = proj_one("down_proj", 2, h, e);
+        mx::eval({d});
+        d_parts.push_back(std::move(d));
+    }
+
+    auto all_d = (d_parts.size() == 1) ? d_parts[0] : mx::concatenate(d_parts, 0);
+    std::vector<int32_t> inv_perm(N * K);
+    for (int i = 0; i < N * K; ++i) {
+        inv_perm[perm[i]] = i;
+    }
+    auto inv_arr = mx::array(inv_perm.data(), {N * K}, mx::int32);
+    auto out_flat = mx::take(all_d, inv_arr, 0);
+    return mx::reshape(out_flat, {B, L, K, out_flat.shape(-1)});
 }
 
 } // namespace qwen38

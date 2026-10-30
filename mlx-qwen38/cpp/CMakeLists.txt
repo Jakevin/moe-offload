@@ -36,6 +36,10 @@ add_executable(qwen38_decode tools/qwen38_decode.cpp)
 target_link_libraries(qwen38_decode PRIVATE qwen38core)
 set_target_properties(qwen38_decode PROPERTIES BUILD_RPATH "${MLX_ROOT}/lib" INSTALL_RPATH "${MLX_ROOT}/lib")
 
+add_executable(qwen38_decode_k50 tools/qwen38_decode.cpp)
+target_link_libraries(qwen38_decode_k50 PRIVATE qwen38core)
+set_target_properties(qwen38_decode_k50 PROPERTIES BUILD_RPATH "${MLX_ROOT}/lib" INSTALL_RPATH "${MLX_ROOT}/lib")
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kernels.cpp")
   add_executable(test_kernels tests/test_kernels.cpp)
   target_link_libraries(test_kernels PRIVATE qwen38core)

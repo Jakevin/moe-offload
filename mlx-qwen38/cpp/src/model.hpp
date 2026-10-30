@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -35,6 +37,7 @@ struct QLinear {
     int group_size = 64;
     int bits = 4;
     bool is_quantized = false;
+    bool reshape_2d = false;
 
     mx::array forward(const mx::array& x) const;
 };
@@ -54,6 +57,139 @@ struct QSwitchLinear {
     mx::array forward(const mx::array& x, const mx::array& indices, bool sorted_indices = false) const;
 };
 
+// K50 v3/v4 ExpertPack + StackedSwitchMlp + ResidentCache
+struct K50PackRecord {
+    int expert = -1;
+    std::string kind; // "tern" | "2t" | "2" | "3" | "4" | "6" | "8"
+    std::string unit; // "hot" | "warm" | "mid" | "cold" | "dense"
+    std::vector<int> shape;
+    int row_bytes = 0;
+    uint64_t code_off = 0;
+    uint64_t code_nbytes = 0;
+    uint64_t scale_off = 0;
+    uint64_t scale_nbytes = 0;
+    uint64_t bias_off = 0;
+    uint64_t bias_nbytes = 0;
+    int group_size = 64;
+};
+
+struct K50MaterializedWeight {
+    std::string kind;
+    int bits = 2;
+    int group_size = 64;
+    mx::array weight{mx::zeros({0})};
+    mx::array scales{mx::zeros({0})};
+    mx::array biases{mx::zeros({0})};
+    size_t nbytes = 0;
+};
+
+class ExpertPackCpp {
+public:
+    int layer_idx = 0;
+    std::string layer_dir;
+    int fd_codes = -1;
+    int fd_scales = -1;
+    int fd_bias = -1;
+    std::unordered_map<std::string, K50PackRecord> dense;
+    std::unordered_map<std::string, K50PackRecord> experts; // key: "proj:eid"
+
+    explicit ExpertPackCpp(const std::string& dir, int l_idx = 0);
+    ~ExpertPackCpp();
+
+    K50MaterializedWeight materialize(const K50PackRecord& rec);
+    K50MaterializedWeight materialize_as_affine2(const K50PackRecord& rec);
+    QLinear load_dense_qlinear(const std::string& name);
+};
+
+struct K50CacheKey {
+    uint8_t layer_id = 0;
+    uint8_t proj_id = 0; // 0: gate_proj, 1: up_proj, 2: down_proj
+    uint16_t expert_id = 0;
+    bool operator==(const K50CacheKey& o) const {
+        return layer_id == o.layer_id && proj_id == o.proj_id && expert_id == o.expert_id;
+    }
+};
+
+struct K50CacheKeyHash {
+    size_t operator()(const K50CacheKey& k) const {
+        return (static_cast<size_t>(k.layer_id) << 24) ^
+               (static_cast<size_t>(k.proj_id) << 16) ^
+               static_cast<size_t>(k.expert_id);
+    }
+};
+
+class K50ResidentCache {
+public:
+    size_t budget_bytes = 0;
+    size_t pinned_bytes = 0;
+    size_t lru_bytes = 0;
+    uint64_t hot_hits = 0;
+    uint64_t lru_hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+
+    bool in_prefill = false;
+    uint64_t prefill_hot_hits = 0;
+    uint64_t prefill_lru_hits = 0;
+    uint64_t prefill_misses = 0;
+
+    std::list<std::pair<K50CacheKey, K50MaterializedWeight>> lru_list;
+    std::unordered_map<
+        K50CacheKey,
+        std::list<std::pair<K50CacheKey, K50MaterializedWeight>>::iterator,
+        K50CacheKeyHash> lru_map;
+
+    void set_budget(size_t total_budget_bytes, size_t pinned_hot_bytes);
+    void clear_lru();
+    void reset_stats();
+    void record_hot_hit(uint64_t count = 1);
+    const K50MaterializedWeight& get_or_load(
+        uint8_t layer_id,
+        uint8_t proj_id,
+        uint16_t expert_id,
+        ExpertPackCpp& pack,
+        const K50PackRecord& rec);
+};
+
+struct K50StackedGroup {
+    std::string kind; // "2t" | "2" | "3" | "4" | "6" | "8"
+    int bits = 2;
+    int group_size = 64;
+    mx::array weights{mx::zeros({0})};
+    mx::array scales{mx::zeros({0})};
+    mx::array biases{mx::zeros({0})};
+    std::vector<int32_t> e2l;
+    size_t nbytes = 0;
+};
+
+struct StackedSwitchMlp {
+    int layer_idx = 0;
+    int num_experts = 512;
+    std::shared_ptr<ExpertPackCpp> pack;
+    std::map<std::string, std::map<std::string, K50StackedGroup>> groups;
+    std::map<std::string, std::vector<bool>> is_stacked;
+    size_t stacked_bytes = 0;
+
+    void build(
+        int l_idx,
+        std::shared_ptr<ExpertPackCpp> p,
+        int n_experts,
+        const std::string& mode = "hot");
+
+    mx::array proj_all(
+        const std::string& proj_name,
+        uint8_t proj_id,
+        const mx::array& x,
+        const std::vector<int32_t>& route,
+        bool expand_x,
+        K50ResidentCache* cache);
+
+    mx::array forward(
+        const mx::array& x,
+        const mx::array& indices,
+        K50ResidentCache* cache);
+};
+
 // Hyper-Connection Gated Residual (with or without block_inject_weight)
 struct HyperConnection {
     int hc_count = 4;
@@ -62,6 +198,7 @@ struct HyperConnection {
     float eps = 1e-6f;
     bool use_combine = true;
     mx::array norm_weight{mx::zeros({0})};
+    mx::array norm_scale_f32{mx::zeros({0})};
     mx::array eps_arr{mx::zeros({0})};
     QLinear down;
     QLinear up;
@@ -84,6 +221,7 @@ struct LinearAttnLayer {
     QLinear in_proj_b;
     QLinear in_proj_a;
     mx::array conv1d_weight{mx::zeros({0})};
+    mx::array conv_weight_decode_f32{mx::zeros({0})};
     mx::array dt_bias{mx::zeros({0})};
     mx::array A_log{mx::zeros({0})};
     mx::array norm_weight{mx::zeros({0})};
@@ -182,6 +320,7 @@ struct PleLayer {
 
     std::vector<int64_t> multipliers_cpu; // length 3
     std::vector<int64_t> moduli_cpu;      // length 16 (2 ngrams * 8 heads)
+    std::vector<int64_t> head_offsets_cpu; // length 16 (cumulative sum of moduli)
     std::vector<int64_t> shard_offsets;   // length 129
     std::vector<PleShardSpec> shards;     // length 128
     mx::array weight_scale{mx::zeros({0})}; // scalar bfloat16/float32
@@ -220,6 +359,11 @@ struct DecoderLayer {
     QSwitchLinear res_down_proj;
     // Layers 1..47 offloaded experts:
     OffloadLayerCache offload;
+    // K50 v3 experts (L00: 512, L01..L47: 256):
+    bool k50_moe = false;
+    int num_experts = 512;
+    std::shared_ptr<ExpertPackCpp> k50_pack;
+    StackedSwitchMlp k50_switch;
 };
 
 // Runtime caches for 48 layers
@@ -264,6 +408,9 @@ struct EngineOptions {
     std::string budget_log;             // --budget-log FILE (default logs/budget_<pid>.jsonl)
     double force_miss_rate = 0.0;       // --force-miss-rate R (0..1)
     uint64_t force_miss_seed = 42;      // --force-miss-seed S
+    // K50 v3 options:
+    double resident_gb = 15.6;
+    std::string stack_mode = "hot";     // "hot" | "all"
 };
 
 struct RunMetrics {
@@ -306,6 +453,19 @@ struct RunMetrics {
     double io_wait_ms = 0.0;
     uint64_t forced_invalidations = 0;
     std::vector<P1LayerStats> p1_layer_stats;
+    // K50 v3 resident cache & expert hit/miss telemetry:
+    bool is_k50_v3 = false;
+    uint64_t k50_pinned_bytes = 0;
+    uint64_t k50_lru_budget_bytes = 0;
+    uint64_t k50_lru_bytes = 0;
+    uint64_t k50_lru_entries = 0;
+    uint64_t k50_hot_hits = 0;
+    uint64_t k50_lru_hits = 0;
+    uint64_t k50_misses = 0;
+    uint64_t k50_evictions = 0;
+    uint64_t k50_prefill_hot_hits = 0;
+    uint64_t k50_prefill_lru_hits = 0;
+    uint64_t k50_prefill_misses = 0;
 };
 
 class Qwen38Engine {
@@ -463,11 +623,15 @@ private:
     mx::fast::CustomKernelFunction mrope_3d_kernel_;
 
     // Model weights
-    QLinear embed_tokens_; // QuantizedEmbedding (weight, scales, biases, 4-bit group_size=32)
+    bool is_k50_v3_ = false;
+    K50ResidentCache k50_cache_;
+    QLinear embed_tokens_; // QuantizedEmbedding (weight, scales, biases, 4-bit group_size=32 or 8-bit group_size=64)
     std::vector<DecoderLayer> layers_; // size 48
     PleLayer ple_;                     // Layer 1 PLE
     HyperConnection final_mixer_;      // use_combine = false
     QLinear lm_head_;
+
+    void load_k50_v3();
 
     // Open file descriptors & mmaps
     std::unordered_map<std::string, int> open_fds_;

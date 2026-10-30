@@ -59,3 +59,28 @@ Gate setup: 4 prompts (40–119 tokens), 128 greedy tokens each, `--io exact --b
   - `--io p1 --budget auto`: 8.2 tok/s, peak phys_footprint 16.9 GB.
 
 Note: the reference loader build includes I/O scheduling and accounting that `../expert_io.c` / `../loader.py` in this repo do not have yet, so `third_party/expert_io.c` is a newer superset. Parity against the published `loader.py` has not been re-measured.
+
+## Running the K50 `2t` model (Jakevin/Qwen3.8-Flash-Next-mixed-mlx-K50)
+
+The runner also reads the expert-pruned K50 layout (`L00`–`L47` with `codes.bin` / `scales.bf16` / `bias.bf16` / `index.json`, plus `K50_kept.json`). Expert records of kind `2t` (lossless 2-bit affine form of ternary experts), `2`, `3` and `4` are all supported. Experts marked hot in `index.json` are stacked in memory up to `--resident-gb`; the rest go through an LRU cache and are read from SSD on a miss.
+
+```bash
+# 1. download the weights
+huggingface-cli download Jakevin/Qwen3.8-Flash-Next-mixed-mlx-K50 --local-dir ~/models/k50-2t
+
+# 2. build
+cd mlx-qwen38/cpp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # add -DMLX_ROOT=/path/to/mlx if needed
+cmake --build build -j --target qwen38_decode
+
+# 3. header-only check of every tensor (fast, does not load the weights)
+./build/qwen38_decode --model ~/models/k50-2t --check-weights
+
+# 4. greedy decode; prompts.json = {"prompts": [{"ids": [...]}]} (token ids from the model's tokenizer)
+./build/qwen38_decode --model ~/models/k50-2t --ids prompts.json --prompt-index 0 --n 256 \
+    --resident-gb 15.6 --stack-mode hot --out out/run.json
+```
+
+- `--resident-gb G` (default 15.6): memory for resident experts (hot stack + LRU). Lower it on machines with less than 64 GB.
+- `--stack-mode hot|all`: stack only the hot experts (default) or every expert.
+- `tools/convert_v4_2bit.py --src V3_DIR --dst V4_DIR` converts a ternary K50 (v3) directory into this `2t` layout losslessly; `--verify` additionally needs the v3 Python `runtime.py` (directory in `QWEN38_V3_RUNTIME_DIR`).

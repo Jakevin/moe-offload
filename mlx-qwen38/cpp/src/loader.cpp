@@ -310,6 +310,27 @@ static std::vector<std::string> list_ple_safetensors(const std::string& model_di
 extern void init_ple_metadata(PleLayer& ple, int unigram_vocab_size, int ngram_vocab_base, int divisor, int seed);
 
 bool Qwen38Engine::check_weights() const {
+    if (std::filesystem::exists(opts_.model_dir + "/skeleton.safetensors") &&
+        std::filesystem::exists(opts_.model_dir + "/nonexpert.safetensors")) {
+        for (const char* req : {"/skeleton.safetensors", "/nonexpert.safetensors",
+                                "/ple/ple_bits.json", "/ple/model.safetensors.index.json"}) {
+            if (!std::filesystem::exists(opts_.model_dir + req)) {
+                std::cerr << "[check-weights FAIL] Missing K50 v3 file: " << (opts_.model_dir + req) << "\n";
+                return false;
+            }
+        }
+        for (int l = 0; l < 48; ++l) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "/L%02d/index.json", l);
+            if (!std::filesystem::exists(opts_.model_dir + buf)) {
+                std::cerr << "[check-weights FAIL] Missing K50 v3 layer index: " << (opts_.model_dir + buf) << "\n";
+                return false;
+            }
+        }
+        std::cout << "[check-weights] Verified K50 v3 model directory: " << opts_.model_dir << "\n";
+        return true;
+    }
+
     // 1. Verify config.json exists and has expected Qwen4Exp parameters
     std::string cfg_path = opts_.model_dir + "/config.json";
     std::ifstream cfg_ifs(cfg_path);
@@ -666,6 +687,12 @@ mx::array make_rope_inv_freq(int rotary_dim, float theta) {
 void Qwen38Engine::load() {
     if (loaded_) return;
     init_kernels();
+
+    if (std::filesystem::exists(opts_.model_dir + "/skeleton.safetensors") &&
+        std::filesystem::exists(opts_.model_dir + "/nonexpert.safetensors")) {
+        load_k50_v3();
+        return;
+    }
 
     std::string index_path = opts_.model_dir + "/model.safetensors.index.json";
     std::unordered_map<std::string, std::string> weight_map;
@@ -1155,6 +1182,728 @@ void Qwen38Engine::resize_layer_capacity(int l, int new_cap) {
         c_layer_set_lru_state(l, kept_eids.data(), kept_slots.data(), keep,
                               saved_stats[6], saved_stats[7], saved_stats[8]);
     }
+}
+
+namespace {
+
+struct K50Base3Lut {
+    uint8_t trits[256][5];
+    int8_t signed_trits[256][5];
+
+    K50Base3Lut() {
+        for (int b = 0; b < 256; ++b) {
+            int v = b;
+            for (int k = 0; k < 5; ++k) {
+                int d = v % 3;
+                v /= 3;
+                trits[b][k] = static_cast<uint8_t>(d);
+                signed_trits[b][k] = static_cast<int8_t>(d - 1);
+            }
+        }
+    }
+};
+
+static const K50Base3Lut g_k50_base3_lut;
+
+static std::vector<int> parse_k50_int_array(const std::string& s, size_t& i) {
+    std::vector<int> out;
+    skip_ws(s, i);
+    if (i < s.size() && s[i] == '[') ++i;
+    while (i < s.size()) {
+        skip_ws(s, i);
+        if (i < s.size() && s[i] == ']') { ++i; break; }
+        if (s[i] == ',') { ++i; continue; }
+        out.push_back(static_cast<int>(parse_json_int(s, i)));
+    }
+    return out;
+}
+
+static K50PackRecord parse_k50_pack_record(const std::string& s, size_t& i) {
+    K50PackRecord r;
+    skip_ws(s, i);
+    if (i >= s.size() || s[i] != '{') {
+        throw std::runtime_error("Expected '{' in K50PackRecord at pos " + std::to_string(i));
+    }
+    ++i;
+    while (i < s.size()) {
+        skip_ws(s, i);
+        if (i < s.size() && s[i] == '}') { ++i; break; }
+        if (s[i] == ',') { ++i; continue; }
+        std::string key = parse_json_string(s, i);
+        skip_ws(s, i);
+        if (i < s.size() && s[i] == ':') ++i;
+        skip_ws(s, i);
+        if (i < s.size() && s.compare(i, 4, "null") == 0) {
+            i += 4;
+            continue;
+        }
+        if (key == "expert") {
+            r.expert = static_cast<int>(parse_json_int(s, i));
+        } else if (key == "kind") {
+            r.kind = parse_json_string(s, i);
+        } else if (key == "unit") {
+            r.unit = parse_json_string(s, i);
+        } else if (key == "shape") {
+            r.shape = parse_k50_int_array(s, i);
+        } else if (key == "row_bytes") {
+            r.row_bytes = static_cast<int>(parse_json_int(s, i));
+        } else if (key == "code_off") {
+            r.code_off = static_cast<uint64_t>(parse_json_int(s, i));
+        } else if (key == "code_nbytes") {
+            r.code_nbytes = static_cast<uint64_t>(parse_json_int(s, i));
+        } else if (key == "scale_off") {
+            r.scale_off = static_cast<uint64_t>(parse_json_int(s, i));
+        } else if (key == "scale_nbytes") {
+            r.scale_nbytes = static_cast<uint64_t>(parse_json_int(s, i));
+        } else if (key == "bias_off") {
+            r.bias_off = static_cast<uint64_t>(parse_json_int(s, i));
+        } else if (key == "bias_nbytes") {
+            r.bias_nbytes = static_cast<uint64_t>(parse_json_int(s, i));
+        } else if (key == "group_size") {
+            r.group_size = static_cast<int>(parse_json_int(s, i));
+        } else {
+            skip_json_value(s, i);
+        }
+    }
+    return r;
+}
+
+static size_t compute_materialized_bytes(const K50MaterializedWeight& m) {
+    size_t total = m.weight.nbytes() + m.scales.nbytes();
+    if (m.biases.size() > 0) total += m.biases.nbytes();
+    return total;
+}
+
+static void k50_pread_exact(int fd, void* buf, size_t nbytes, uint64_t offset) {
+    uint8_t* dst = static_cast<uint8_t*>(buf);
+    size_t done = 0;
+    while (done < nbytes) {
+        ssize_t r = ::pread(fd, dst + done, nbytes - done, static_cast<off_t>(offset + done));
+        if (r <= 0) {
+            throw std::runtime_error("pread failed at offset " + std::to_string(offset + done));
+        }
+        done += static_cast<size_t>(r);
+    }
+}
+
+} // namespace
+
+ExpertPackCpp::ExpertPackCpp(const std::string& dir, int l_idx)
+    : layer_idx(l_idx), layer_dir(dir) {
+    fd_codes = ::open((dir + "/codes.bin").c_str(), O_RDONLY);
+    fd_scales = ::open((dir + "/scales.bf16").c_str(), O_RDONLY);
+    fd_bias = ::open((dir + "/bias.bf16").c_str(), O_RDONLY);
+    if (fd_codes < 0 || fd_scales < 0 || fd_bias < 0) {
+        throw std::runtime_error("Failed to open codes.bin/scales.bf16/bias.bf16 in " + dir);
+    }
+
+    std::ifstream ifs(dir + "/index.json");
+    if (!ifs) {
+        throw std::runtime_error("Cannot open " + dir + "/index.json");
+    }
+    std::ostringstream ss;
+    ss << ifs.rdbuf();
+    std::string s = ss.str();
+
+    size_t i = 0;
+    skip_ws(s, i);
+    if (i >= s.size() || s[i] != '{') {
+        throw std::runtime_error("Invalid index.json in " + dir);
+    }
+    ++i;
+    while (i < s.size()) {
+        skip_ws(s, i);
+        if (i < s.size() && s[i] == '}') { ++i; break; }
+        if (s[i] == ',') { ++i; continue; }
+        std::string top_key = parse_json_string(s, i);
+        skip_ws(s, i);
+        if (i < s.size() && s[i] == ':') ++i;
+        skip_ws(s, i);
+        if (top_key == "dense") {
+            if (i >= s.size() || s[i] != '{') {
+                throw std::runtime_error("Expected '{' for dense in " + dir);
+            }
+            ++i;
+            while (i < s.size()) {
+                skip_ws(s, i);
+                if (i < s.size() && s[i] == '}') { ++i; break; }
+                if (s[i] == ',') { ++i; continue; }
+                std::string rec_key = parse_json_string(s, i);
+                skip_ws(s, i);
+                if (i < s.size() && s[i] == ':') ++i;
+                K50PackRecord rec = parse_k50_pack_record(s, i);
+                dense.emplace(std::move(rec_key), std::move(rec));
+            }
+        } else if (top_key == "experts") {
+            if (i >= s.size() || s[i] != '{') {
+                throw std::runtime_error("Expected '{' for experts in " + dir);
+            }
+            ++i;
+            while (i < s.size()) {
+                skip_ws(s, i);
+                if (i < s.size() && s[i] == '}') { ++i; break; }
+                if (s[i] == ',') { ++i; continue; }
+                std::string proj_name = parse_json_string(s, i);
+                skip_ws(s, i);
+                if (i < s.size() && s[i] == ':') ++i;
+                skip_ws(s, i);
+                if (i >= s.size() || s[i] != '[') {
+                    throw std::runtime_error("Expected '[' for experts." + proj_name + " in " + dir);
+                }
+                ++i;
+                while (i < s.size()) {
+                    skip_ws(s, i);
+                    if (i < s.size() && s[i] == ']') { ++i; break; }
+                    if (s[i] == ',') { ++i; continue; }
+                    K50PackRecord rec = parse_k50_pack_record(s, i);
+                    std::string key = proj_name + ":" + std::to_string(rec.expert);
+                    experts.emplace(std::move(key), std::move(rec));
+                }
+            }
+        } else {
+            skip_json_value(s, i);
+        }
+    }
+}
+
+ExpertPackCpp::~ExpertPackCpp() {
+    if (fd_codes >= 0) ::close(fd_codes);
+    if (fd_scales >= 0) ::close(fd_scales);
+    if (fd_bias >= 0) ::close(fd_bias);
+}
+
+K50MaterializedWeight ExpertPackCpp::materialize(const K50PackRecord& rec) {
+    return materialize_as_affine2(rec);
+}
+
+K50MaterializedWeight ExpertPackCpp::materialize_as_affine2(const K50PackRecord& rec) {
+    int n = rec.shape[0];
+    int k = rec.shape[1];
+    int groups = k / rec.group_size;
+
+    std::vector<uint16_t> raw_s(static_cast<size_t>(n) * groups);
+    k50_pread_exact(fd_scales, raw_s.data(), rec.scale_nbytes, rec.scale_off);
+    mx::array scales(
+        reinterpret_cast<const mx::bfloat16_t*>(raw_s.data()),
+        {n, groups},
+        mx::bfloat16);
+
+    if (rec.kind == "tern") {
+        std::vector<uint8_t> raw_c(rec.code_nbytes);
+        k50_pread_exact(fd_codes, raw_c.data(), rec.code_nbytes, rec.code_off);
+
+        int words_per_row = k / 16;
+        std::vector<uint32_t> packed_u32(static_cast<size_t>(n) * words_per_row, 0);
+        int rb = (rec.row_bytes > 0) ? rec.row_bytes : (k / 5);
+        for (int r = 0; r < n; ++r) {
+            const uint8_t* src = raw_c.data() + static_cast<size_t>(r) * rb;
+            uint32_t* dst = packed_u32.data() + static_cast<size_t>(r) * words_per_row;
+            int b_idx = 0;
+            for (int w = 0; w < words_per_row; w += 5) {
+                uint8_t tr[80];
+                for (int j = 0; j < 16; ++j) {
+                    const uint8_t* t5 = g_k50_base3_lut.trits[src[b_idx + j]];
+                    tr[j * 5 + 0] = t5[0];
+                    tr[j * 5 + 1] = t5[1];
+                    tr[j * 5 + 2] = t5[2];
+                    tr[j * 5 + 3] = t5[3];
+                    tr[j * 5 + 4] = t5[4];
+                }
+                b_idx += 16;
+                for (int u = 0; u < 5; ++u) {
+                    uint32_t word = 0;
+                    const uint8_t* tp = tr + u * 16;
+                    for (int j = 0; j < 16; ++j) {
+                        word |= static_cast<uint32_t>(tp[j]) << (2 * j);
+                    }
+                    dst[w + u] = word;
+                }
+            }
+        }
+        mx::array codes(packed_u32.data(), {n, words_per_row}, mx::uint32);
+        std::vector<uint16_t> raw_b_neg(raw_s.size());
+        for (size_t i = 0; i < raw_s.size(); ++i) {
+            raw_b_neg[i] = static_cast<uint16_t>(raw_s[i] ^ 0x8000u);
+        }
+        mx::array biases(
+            reinterpret_cast<const mx::bfloat16_t*>(raw_b_neg.data()),
+            {n, groups},
+            mx::bfloat16);
+
+        K50MaterializedWeight res;
+        res.kind = "2t";
+        res.bits = 2;
+        res.group_size = rec.group_size;
+        res.weight = std::move(codes);
+        res.scales = std::move(scales);
+        res.biases = std::move(biases);
+        res.nbytes = compute_materialized_bytes(res);
+        return res;
+    }
+
+    int words_per_row = static_cast<int>(rec.code_nbytes / (static_cast<size_t>(n) * sizeof(uint32_t)));
+    std::vector<uint32_t> raw_w(static_cast<size_t>(n) * words_per_row);
+    k50_pread_exact(fd_codes, raw_w.data(), rec.code_nbytes, rec.code_off);
+    mx::array codes(raw_w.data(), {n, words_per_row}, mx::uint32);
+
+    std::vector<uint16_t> raw_b(static_cast<size_t>(n) * groups);
+    if (rec.bias_nbytes > 0) {
+        k50_pread_exact(fd_bias, raw_b.data(), rec.bias_nbytes, rec.bias_off);
+    } else {
+        for (size_t i = 0; i < raw_s.size(); ++i) {
+            raw_b[i] = static_cast<uint16_t>(raw_s[i] ^ 0x8000u);
+        }
+    }
+    mx::array biases(
+        reinterpret_cast<const mx::bfloat16_t*>(raw_b.data()),
+        {n, groups},
+        mx::bfloat16);
+
+    int bits = (rec.kind == "2t") ? 2 : std::stoi(rec.kind);
+    K50MaterializedWeight res;
+    res.kind = rec.kind;
+    res.bits = bits;
+    res.group_size = rec.group_size;
+    res.weight = std::move(codes);
+    res.scales = std::move(scales);
+    res.biases = std::move(biases);
+    res.nbytes = compute_materialized_bytes(res);
+    return res;
+}
+
+QLinear ExpertPackCpp::load_dense_qlinear(const std::string& name) {
+    auto it = dense.find(name);
+    if (it == dense.end()) {
+        it = dense.find(name + ".weight");
+    }
+    if (it == dense.end()) {
+        throw std::runtime_error("Missing dense weight in pack (" + layer_dir + "): " + name);
+    }
+    auto mat = materialize_as_affine2(it->second);
+    QLinear ql;
+    ql.is_quantized = true;
+    ql.reshape_2d = true;
+    ql.bits = mat.bits;
+    ql.group_size = mat.group_size;
+    ql.weight = std::move(mat.weight);
+    ql.scales = std::move(mat.scales);
+    ql.biases = std::move(mat.biases);
+    return ql;
+}
+
+void K50ResidentCache::set_budget(size_t total_budget_bytes, size_t pinned_hot_bytes) {
+    pinned_bytes = pinned_hot_bytes;
+    budget_bytes = (total_budget_bytes > pinned_hot_bytes)
+        ? (total_budget_bytes - pinned_hot_bytes)
+        : 0;
+}
+
+void K50ResidentCache::clear_lru() {
+    lru_map.clear();
+    lru_list.clear();
+    lru_bytes = 0;
+}
+
+void K50ResidentCache::reset_stats() {
+    hot_hits = 0;
+    lru_hits = 0;
+    misses = 0;
+    evictions = 0;
+    prefill_hot_hits = 0;
+    prefill_lru_hits = 0;
+    prefill_misses = 0;
+}
+
+void K50ResidentCache::record_hot_hit(uint64_t count) {
+    if (in_prefill) {
+        prefill_hot_hits += count;
+    } else {
+        hot_hits += count;
+    }
+}
+
+const K50MaterializedWeight& K50ResidentCache::get_or_load(
+    uint8_t layer_id,
+    uint8_t proj_id,
+    uint16_t expert_id,
+    ExpertPackCpp& pack,
+    const K50PackRecord& rec) {
+    K50CacheKey key{layer_id, proj_id, expert_id};
+    auto it = lru_map.find(key);
+    if (it != lru_map.end()) {
+        if (in_prefill) {
+            prefill_lru_hits++;
+        } else {
+            lru_hits++;
+        }
+        lru_list.splice(lru_list.end(), lru_list, it->second);
+        return it->second->second;
+    }
+
+    if (in_prefill) {
+        prefill_misses++;
+    } else {
+        misses++;
+    }
+
+    // On-miss: materialize and convert ternary ("tern") to 2-bit affine ("2t")
+    K50MaterializedWeight val = pack.materialize_as_affine2(rec);
+    size_t sz = val.nbytes;
+
+    while (budget_bytes > 0 && (lru_bytes + sz > budget_bytes) && !lru_list.empty()) {
+        auto& oldest = lru_list.front();
+        lru_bytes -= oldest.second.nbytes;
+        lru_map.erase(oldest.first);
+        lru_list.pop_front();
+        evictions++;
+    }
+
+    lru_list.emplace_back(key, std::move(val));
+    auto new_it = std::prev(lru_list.end());
+    lru_map[key] = new_it;
+    lru_bytes += sz;
+    return new_it->second;
+}
+
+void StackedSwitchMlp::build(
+    int l_idx,
+    std::shared_ptr<ExpertPackCpp> p,
+    int n_experts,
+    const std::string& mode) {
+    layer_idx = l_idx;
+    pack = std::move(p);
+    num_experts = n_experts;
+    groups.clear();
+    is_stacked.clear();
+    stacked_bytes = 0;
+
+    for (const char* proj_c : {"gate_proj", "up_proj", "down_proj"}) {
+        std::string proj(proj_c);
+        is_stacked[proj].assign(num_experts, false);
+        std::map<std::string, std::vector<int>> by_kind;
+        for (int e = 0; e < num_experts; ++e) {
+            std::string key = proj + ":" + std::to_string(e);
+            auto it = pack->experts.find(key);
+            if (it == pack->experts.end()) {
+                throw std::runtime_error("Missing expert record: " + key + " in layer " + std::to_string(l_idx));
+            }
+            const auto& rec = it->second;
+            if (mode == "hot" && rec.unit != "hot") continue;
+            by_kind[rec.kind].push_back(e);
+        }
+
+        for (auto& kv : by_kind) {
+            const std::string& kind = kv.first;
+            const std::vector<int>& eids = kv.second;
+            std::vector<mx::array> ws;
+            std::vector<mx::array> ss;
+            std::vector<mx::array> bs;
+            ws.reserve(eids.size());
+            ss.reserve(eids.size());
+            bs.reserve(eids.size());
+
+            K50StackedGroup grp;
+            grp.e2l.assign(num_experts, -1);
+            for (size_t local_idx = 0; local_idx < eids.size(); ++local_idx) {
+                int e = eids[local_idx];
+                grp.e2l[e] = static_cast<int32_t>(local_idx);
+                is_stacked[proj][e] = true;
+                const auto& rec = pack->experts.at(proj + ":" + std::to_string(e));
+                auto mat = pack->materialize_as_affine2(rec);
+                grp.kind = mat.kind;
+                grp.bits = mat.bits;
+                grp.group_size = mat.group_size;
+                ws.push_back(std::move(mat.weight));
+                ss.push_back(std::move(mat.scales));
+                bs.push_back(std::move(mat.biases));
+            }
+            grp.weights = mx::stack(ws, 0);
+            grp.scales = mx::stack(ss, 0);
+            grp.biases = mx::stack(bs, 0);
+            mx::eval({grp.weights, grp.scales, grp.biases});
+            grp.nbytes = grp.weights.nbytes() + grp.scales.nbytes() + grp.biases.nbytes();
+            stacked_bytes += grp.nbytes;
+            std::string gkey = grp.kind;
+            groups[proj].emplace(gkey, std::move(grp));
+        }
+    }
+}
+
+void Qwen38Engine::load_k50_v3() {
+    is_k50_v3_ = true;
+
+    // 1. Load skeleton.safetensors (embed + head, 8-bit group_size=64)
+    auto [skel_tensors, _skel_meta] = mx::load_safetensors(opts_.model_dir + "/skeleton.safetensors");
+    embed_tokens_ = load_qlinear(skel_tensors, "embed", 64, 8);
+    lm_head_ = load_qlinear(skel_tensors, "head", 64, 8);
+    mx::eval({
+        embed_tokens_.weight, *embed_tokens_.scales, *embed_tokens_.biases,
+        lm_head_.weight, *lm_head_.scales, *lm_head_.biases
+    });
+
+    // 2. Load nonexpert.safetensors (hyper-connections, norms, GDN projections, gates, L1.ple)
+    auto [nonexp_tensors, _nonexp_meta] = mx::load_safetensors(opts_.model_dir + "/nonexpert.safetensors");
+
+    auto load_k50_hc = [&](const std::string& prefix, bool use_combine) -> HyperConnection {
+        HyperConnection hc;
+        hc.use_combine = use_combine;
+        hc.norm_weight = nonexp_tensors.at(prefix + ".hc_norm.weight");
+        hc.norm_scale_f32 = mx::add(
+            mx::array(1.0f, mx::float32),
+            mx::astype(hc.norm_weight, mx::float32));
+        hc.eps_arr = mx::array({1e-6f}, mx::float32);
+        hc.down.is_quantized = false;
+        hc.down.weight = nonexp_tensors.at(prefix + ".input_mix_weight_down.weight");
+        hc.up.is_quantized = false;
+        hc.up.weight = nonexp_tensors.at(prefix + ".input_mix_weight_up.weight");
+        if (use_combine) {
+            hc.inject.is_quantized = false;
+            hc.inject.weight = nonexp_tensors.at(prefix + ".block_inject_weight.weight");
+            mx::eval({hc.norm_weight, hc.norm_scale_f32, hc.eps_arr,
+                      hc.down.weight, hc.up.weight, hc.inject.weight});
+        } else {
+            mx::eval({hc.norm_weight, hc.norm_scale_f32, hc.eps_arr,
+                      hc.down.weight, hc.up.weight});
+        }
+        return hc;
+    };
+
+    auto quantize_affine8 = [](const mx::array& w_bf16) -> QLinear {
+        auto q_tup = mx::quantize(mx::astype(w_bf16, mx::float32), 64, 8, "affine");
+        QLinear ql;
+        ql.is_quantized = true;
+        ql.bits = 8;
+        ql.group_size = 64;
+        ql.weight = std::move(q_tup[0]);
+        ql.scales = std::move(q_tup[1]);
+        ql.biases = std::move(q_tup[2]);
+        mx::eval({ql.weight, *ql.scales, *ql.biases});
+        return ql;
+    };
+
+    final_mixer_ = load_k50_hc("hyper", false);
+    auto rope_inv_freq = make_rope_inv_freq(64, 10000000.0f);
+
+    layers_.resize(48);
+    exec_caches_.resize(48);
+    last_slot_reader_.resize(48, std::nullopt);
+    current_caps_.assign(48, 0);
+
+    size_t pinned_hot_bytes = 0;
+
+    // 3. Load all 48 decoder layers (L00..L47)
+    for (int l = 0; l < 48; ++l) {
+        auto& layer = layers_[l];
+        layer.layer_idx = l;
+        layer.is_linear = (l % 4 != 3);
+        layer.k50_moe = true;
+        layer.num_experts = (l == 0) ? 512 : 256;
+        exec_caches_[l].is_linear = layer.is_linear;
+
+        char ldir_buf[32];
+        std::snprintf(ldir_buf, sizeof(ldir_buf), "/L%02d", l);
+        layer.k50_pack = std::make_shared<ExpertPackCpp>(opts_.model_dir + ldir_buf, l);
+        layer.k50_switch.build(l, layer.k50_pack, layer.num_experts, opts_.stack_mode);
+        pinned_hot_bytes += layer.k50_switch.stacked_bytes;
+
+        std::string lp = "L" + std::to_string(l);
+        layer.attn_hc = load_k50_hc(lp + ".attn_hyper_connection", true);
+        layer.mlp_hc = load_k50_hc(lp + ".mlp_hyper_connection", true);
+
+        if (layer.is_linear) {
+            layer.lin_attn.in_proj_qkv = layer.k50_pack->load_dense_qlinear("linear_attn.in_proj_qkv");
+            layer.lin_attn.in_proj_z = layer.k50_pack->load_dense_qlinear("linear_attn.in_proj_z");
+            layer.lin_attn.out_proj = layer.k50_pack->load_dense_qlinear("linear_attn.out_proj");
+
+            std::string ap = lp + ".linear_attn";
+            layer.lin_attn.in_proj_b.is_quantized = false;
+            layer.lin_attn.in_proj_b.weight = nonexp_tensors.at(ap + ".in_proj_b.weight");
+            layer.lin_attn.in_proj_a.is_quantized = false;
+            layer.lin_attn.in_proj_a.weight = nonexp_tensors.at(ap + ".in_proj_a.weight");
+
+            mx::array raw_conv = nonexp_tensors.at(ap + ".conv1d.weight");
+            if (raw_conv.ndim() == 3 && raw_conv.shape(1) < raw_conv.shape(2)) {
+                raw_conv = mx::swapaxes(raw_conv, 1, 2);
+            }
+            layer.lin_attn.conv1d_weight = raw_conv;
+            layer.lin_attn.conv_weight_decode_f32 = mx::astype(
+                mx::transpose(mx::squeeze(layer.lin_attn.conv1d_weight, -1)), mx::float32);
+            layer.lin_attn.dt_bias = nonexp_tensors.at(ap + ".dt_bias");
+            layer.lin_attn.A_log = nonexp_tensors.at(ap + ".A_log");
+            layer.lin_attn.norm_weight = nonexp_tensors.at(ap + ".norm.weight");
+            mx::eval({
+                layer.lin_attn.in_proj_b.weight,
+                layer.lin_attn.in_proj_a.weight,
+                layer.lin_attn.conv1d_weight,
+                layer.lin_attn.conv_weight_decode_f32,
+                layer.lin_attn.dt_bias,
+                layer.lin_attn.A_log,
+                layer.lin_attn.norm_weight
+            });
+        } else {
+            layer.full_attn.q_proj = layer.k50_pack->load_dense_qlinear("self_attn.q_proj");
+            layer.full_attn.k_proj = layer.k50_pack->load_dense_qlinear("self_attn.k_proj");
+            layer.full_attn.v_proj = layer.k50_pack->load_dense_qlinear("self_attn.v_proj");
+            layer.full_attn.o_proj = layer.k50_pack->load_dense_qlinear("self_attn.o_proj");
+            layer.full_attn.index_qk_proj = layer.k50_pack->load_dense_qlinear("self_attn.indexer.index_qk_proj");
+
+            std::string ap = lp + ".self_attn";
+            auto q_nw = nonexp_tensors.at(ap + ".q_norm.weight");
+            auto k_nw = nonexp_tensors.at(ap + ".k_norm.weight");
+            layer.full_attn.q_norm_scale = mx::add(mx::array(1.0f, mx::float32), mx::astype(q_nw, mx::float32));
+            layer.full_attn.k_norm_scale = mx::add(mx::array(1.0f, mx::float32), mx::astype(k_nw, mx::float32));
+            layer.full_attn.rope_inv_freq = rope_inv_freq;
+
+            auto iq_nw = nonexp_tensors.at(ap + ".indexer.q_layernorm.weight");
+            auto ik_nw = nonexp_tensors.at(ap + ".indexer.k_layernorm.weight");
+            layer.full_attn.index_q_norm_scale = mx::add(mx::array(1.0f, mx::float32), mx::astype(iq_nw, mx::float32));
+            layer.full_attn.index_k_norm_scale = mx::add(mx::array(1.0f, mx::float32), mx::astype(ik_nw, mx::float32));
+            layer.full_attn.index_rope_inv_freq = rope_inv_freq;
+            mx::eval({
+                layer.full_attn.q_norm_scale,
+                layer.full_attn.k_norm_scale,
+                layer.full_attn.index_q_norm_scale,
+                layer.full_attn.index_k_norm_scale
+            });
+        }
+
+        // Router & shared expert
+        std::string mp = lp + ".mlp";
+        layer.gate = quantize_affine8(nonexp_tensors.at(mp + ".gate.weight"));
+        layer.shared_expert_gate = quantize_affine8(nonexp_tensors.at(mp + ".shared_expert_gate.weight"));
+        layer.shared_gate_proj = layer.k50_pack->load_dense_qlinear("mlp.shared_expert.gate_proj");
+        layer.shared_up_proj = layer.k50_pack->load_dense_qlinear("mlp.shared_expert.up_proj");
+        layer.shared_down_proj = layer.k50_pack->load_dense_qlinear("mlp.shared_expert.down_proj");
+    }
+
+    // 4. Configure Layer 1 PLE (mixed 2..6-bit from ple/ple_bits.json + ple/model-*.safetensors)
+    ple_.active = true;
+    init_ple_metadata(ple_, 248320, 20000000, 128, 1234);
+    ple_.key_proj.is_quantized = false;
+    ple_.key_proj.weight = nonexp_tensors.at("L1.ple.key_proj.weight");
+    ple_.value_proj.is_quantized = false;
+    ple_.value_proj.weight = nonexp_tensors.at("L1.ple.value_proj.weight");
+    ple_.norm_key_weight = nonexp_tensors.at("L1.ple.norm_key.weight");
+    ple_.norm_query_weight = nonexp_tensors.at("L1.ple.norm_query.weight");
+    ple_.norm_conv_weight = nonexp_tensors.at("L1.ple.norm_conv.weight");
+
+    mx::array raw_ple_conv = nonexp_tensors.at("L1.ple.conv1d.weight");
+    if (raw_ple_conv.ndim() == 3 && raw_ple_conv.shape(1) < raw_ple_conv.shape(2)) {
+        raw_ple_conv = mx::swapaxes(raw_ple_conv, 1, 2);
+    }
+    ple_.short_conv_weight = mx::contiguous(mx::squeeze(raw_ple_conv, -1));
+    ple_.weight_scale = nonexp_tensors.at("L1.ple.ple_embedding.ngram_embedding.weight_scale");
+
+    auto mult_arr = nonexp_tensors.at("L1.ple.ple_embedding.layer_multipliers");
+    auto mod_arr = nonexp_tensors.at("L1.ple.ple_embedding.ngram_heads_vocab_sizes");
+    auto hoff_arr = nonexp_tensors.at("L1.ple.ple_embedding.ngram_heads_offsets");
+    mx::eval({
+        ple_.key_proj.weight, ple_.value_proj.weight,
+        ple_.norm_key_weight, ple_.norm_query_weight, ple_.norm_conv_weight,
+        ple_.short_conv_weight, ple_.weight_scale,
+        mult_arr, mod_arr, hoff_arr
+    });
+
+    ple_.multipliers_cpu.assign(mult_arr.data<int64_t>(), mult_arr.data<int64_t>() + 3);
+    ple_.moduli_cpu.assign(mod_arr.data<int64_t>(), mod_arr.data<int64_t>() + 16);
+    ple_.head_offsets_cpu.assign(hoff_arr.data<int64_t>(), hoff_arr.data<int64_t>() + 16);
+
+    // Parse ple/ple_bits.json
+    std::vector<int> shard_bits(128, 4);
+    int ple_gs = 32;
+    std::string ple_prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_";
+    {
+        std::string bits_path = opts_.model_dir + "/ple/ple_bits.json";
+        std::ifstream bifs(bits_path);
+        if (!bifs) throw std::runtime_error("Cannot open " + bits_path);
+        std::ostringstream bss;
+        bss << bifs.rdbuf();
+        std::string bs = bss.str();
+        size_t i = 0;
+        skip_ws(bs, i);
+        if (i < bs.size() && bs[i] == '{') ++i;
+        while (i < bs.size()) {
+            skip_ws(bs, i);
+            if (i < bs.size() && bs[i] == '}') { ++i; break; }
+            if (bs[i] == ',') { ++i; continue; }
+            std::string top_k = parse_json_string(bs, i);
+            skip_ws(bs, i);
+            if (i < bs.size() && bs[i] == ':') ++i;
+            skip_ws(bs, i);
+            if (top_k == "group_size") {
+                ple_gs = static_cast<int>(parse_json_int(bs, i));
+            } else if (top_k == "prefix") {
+                ple_prefix = parse_json_string(bs, i);
+            } else if (top_k == "shards") {
+                if (i < bs.size() && bs[i] == '{') ++i;
+                while (i < bs.size()) {
+                    skip_ws(bs, i);
+                    if (i < bs.size() && bs[i] == '}') { ++i; break; }
+                    if (bs[i] == ',') { ++i; continue; }
+                    std::string skey = parse_json_string(bs, i);
+                    int sidx = std::stoi(skey);
+                    skip_ws(bs, i);
+                    if (i < bs.size() && bs[i] == ':') ++i;
+                    shard_bits[sidx] = static_cast<int>(parse_json_int(bs, i));
+                }
+            } else {
+                skip_json_value(bs, i);
+            }
+        }
+    }
+
+    // Parse ple/model.safetensors.index.json and mmap PLE shard files
+    auto ple_wmap = parse_weight_map(opts_.model_dir + "/ple/model.safetensors.index.json");
+    std::unordered_map<std::string, SafeTensorHeader> ple_hdrs;
+    for (const auto& kv : ple_wmap) {
+        const std::string& fname = kv.second;
+        if (ple_mmaps_.find(fname) == ple_mmaps_.end()) {
+            std::string full_path = opts_.model_dir + "/ple/" + fname;
+            auto hdr = parse_safetensors_header(full_path);
+            auto mm = std::make_shared<MmapFile>();
+            mm->fd = ::open(full_path.c_str(), O_RDONLY);
+            if (mm->fd < 0) throw std::runtime_error("Cannot open PLE shard: " + full_path);
+            struct stat st{};
+            ::fstat(mm->fd, &st);
+            mm->size = static_cast<size_t>(st.st_size);
+            mm->addr = ::mmap(nullptr, mm->size, PROT_READ, MAP_PRIVATE, mm->fd, 0);
+            if (mm->addr == MAP_FAILED) throw std::runtime_error("mmap failed for: " + full_path);
+            ::madvise(mm->addr, mm->size, MADV_RANDOM);
+            mm->data_start = hdr.data_start;
+            ple_mmaps_[fname] = mm;
+            ple_hdrs[fname] = std::move(hdr);
+        }
+    }
+
+    ple_.shards.resize(128);
+    auto resolve_k50_ple_slice = [&](const std::string& tname) -> PleTensorSlice {
+        const std::string& fname = ple_wmap.at(tname);
+        const auto& mm = ple_mmaps_.at(fname);
+        const auto& entry = ple_hdrs.at(fname).tensors.at(tname);
+        PleTensorSlice sl;
+        sl.data_ptr = static_cast<const uint8_t*>(mm->addr) + mm->data_start + entry.data_offset_start;
+        sl.rows = entry.shape[0];
+        sl.cols = entry.shape[1];
+        size_t total_bytes = entry.data_offset_end - entry.data_offset_start;
+        sl.row_bytes = static_cast<int64_t>(total_bytes / static_cast<size_t>(sl.rows));
+        sl.dtype = entry.dtype;
+        return sl;
+    };
+
+    for (int s = 0; s < 128; ++s) {
+        std::string sp = ple_prefix + std::to_string(s);
+        ple_.shards[s].weight = resolve_k50_ple_slice(sp + ".weight");
+        ple_.shards[s].scales = resolve_k50_ple_slice(sp + ".scales");
+        ple_.shards[s].biases = resolve_k50_ple_slice(sp + ".biases");
+        ple_.shards[s].bits = shard_bits[s];
+        ple_.shards[s].group_size = ple_gs;
+    }
+
+    // 5. Configure ResidentCache budget (default 15.6 GB total = pinned hot + cold LRU)
+    size_t total_budget_bytes = static_cast<size_t>(opts_.resident_gb * 1e9);
+    k50_cache_.set_budget(total_budget_bytes, pinned_hot_bytes);
+
+    loaded_ = true;
 }
 
 } // namespace qwen38

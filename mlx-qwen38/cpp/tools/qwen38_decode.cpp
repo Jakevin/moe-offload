@@ -232,6 +232,10 @@ int main(int argc, char** argv) {
                 opts.dump_dir = next_arg();
             } else if (arg == "--dump-steps") {
                 opts.dump_steps = parse_csv_ints(next_arg());
+            } else if (arg == "--resident-gb") {
+                opts.resident_gb = std::stod(next_arg());
+            } else if (arg == "--stack-mode") {
+                opts.stack_mode = next_arg();
             } else if (arg == "--no-stop") {
                 opts.no_stop = true;
             } else if (arg == "--help" || arg == "-h") {
@@ -314,7 +318,19 @@ int main(int argc, char** argv) {
         ofs << "  \"prefetch_used\": " << m.prefetch_used << ",\n";
         ofs << "  \"prefetch_wasted\": " << m.prefetch_wasted << ",\n";
         ofs << "  \"pin_waits\": " << m.pin_waits << ",\n";
-        ofs << "  \"io_wait_ms\": " << m.io_wait_ms;
+        ofs << "  \"io_wait_ms\": " << m.io_wait_ms << ",\n";
+        ofs << "  \"is_k50_v3\": " << (m.is_k50_v3 ? "true" : "false") << ",\n";
+        ofs << "  \"k50_pinned_bytes\": " << m.k50_pinned_bytes << ",\n";
+        ofs << "  \"k50_lru_budget_bytes\": " << m.k50_lru_budget_bytes << ",\n";
+        ofs << "  \"k50_lru_bytes\": " << m.k50_lru_bytes << ",\n";
+        ofs << "  \"k50_lru_entries\": " << m.k50_lru_entries << ",\n";
+        ofs << "  \"k50_hot_hits\": " << m.k50_hot_hits << ",\n";
+        ofs << "  \"k50_lru_hits\": " << m.k50_lru_hits << ",\n";
+        ofs << "  \"k50_misses\": " << m.k50_misses << ",\n";
+        ofs << "  \"k50_evictions\": " << m.k50_evictions << ",\n";
+        ofs << "  \"k50_prefill_hot_hits\": " << m.k50_prefill_hot_hits << ",\n";
+        ofs << "  \"k50_prefill_lru_hits\": " << m.k50_prefill_lru_hits << ",\n";
+        ofs << "  \"k50_prefill_misses\": " << m.k50_prefill_misses;
         if (!m.p1_layer_stats.empty()) {
             ofs << ",\n  \"p1_per_layer\": [\n";
             for (size_t idx = 0; idx < m.p1_layer_stats.size(); ++idx) {

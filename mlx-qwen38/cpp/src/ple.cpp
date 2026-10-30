@@ -164,10 +164,14 @@ mx::array Qwen38Engine::run_ple(
 
     // Compute head_offsets
     std::vector<int64_t> head_offsets(ple_.ngram_heads);
-    int64_t cum_off = 0;
-    for (int h = 0; h < ple_.ngram_heads; ++h) {
-        head_offsets[h] = cum_off;
-        cum_off += ple_.moduli_cpu[h];
+    if (!ple_.head_offsets_cpu.empty()) {
+        head_offsets = ple_.head_offsets_cpu;
+    } else {
+        int64_t cum_off = 0;
+        for (int h = 0; h < ple_.ngram_heads; ++h) {
+            head_offsets[h] = cum_off;
+            cum_off += ple_.moduli_cpu[h];
+        }
     }
 
     int total_rows = seq_len * ple_.ngram_heads;
@@ -190,43 +194,61 @@ mx::array Qwen38Engine::run_ple(
         }
     }
 
-    // Gather rows from mmap shards
-    int w_cols = static_cast<int>(ple_.shards[0].weight.cols); // 20
-    int s_cols = static_cast<int>(ple_.shards[0].scales.cols); // 5
-    int bits = ple_.shards[0].bits;
-    int group_size = ple_.shards[0].group_size;
-
-    std::vector<uint32_t> w_buf(total_rows * w_cols);
-    std::vector<uint16_t> s_buf(total_rows * s_cols);
-    std::vector<uint16_t> b_buf(total_rows * s_cols);
-
+    // Gather rows from mmap shards (exact match to DiskBackedShardedEmbedding._gather_per_shard)
+    std::vector<int> shard_indices(total_rows);
+    std::vector<int> touched_shards;
     for (int r = 0; r < total_rows; ++r) {
         int64_t gidx = host_indices[r];
         auto it = std::upper_bound(ple_.shard_offsets.begin(), ple_.shard_offsets.end(), gidx);
         int shard_idx = static_cast<int>(std::distance(ple_.shard_offsets.begin(), it)) - 1;
         shard_idx = std::clamp(shard_idx, 0, ple_.split_ngram_parts - 1);
-        int64_t local_row = gidx - ple_.shard_offsets[shard_idx];
+        shard_indices[r] = shard_idx;
+        touched_shards.push_back(shard_idx);
+    }
+    std::sort(touched_shards.begin(), touched_shards.end());
+    touched_shards.erase(std::unique(touched_shards.begin(), touched_shards.end()), touched_shards.end());
+
+    std::vector<mx::array> part_vals;
+    part_vals.reserve(touched_shards.size());
+    std::vector<int> order;
+    order.reserve(total_rows);
+
+    for (int shard_idx : touched_shards) {
+        std::vector<int64_t> local_rows;
+        for (int r = 0; r < total_rows; ++r) {
+            if (shard_indices[r] == shard_idx) {
+                local_rows.push_back(host_indices[r] - ple_.shard_offsets[shard_idx]);
+                order.push_back(r);
+            }
+        }
         const auto& sh = ple_.shards[shard_idx];
-        std::memcpy(
-            w_buf.data() + r * w_cols,
-            sh.weight.data_ptr + local_row * sh.weight.row_bytes,
-            w_cols * sizeof(uint32_t));
-        std::memcpy(
-            s_buf.data() + r * s_cols,
-            sh.scales.data_ptr + local_row * sh.scales.row_bytes,
-            s_cols * sizeof(uint16_t));
-        std::memcpy(
-            b_buf.data() + r * s_cols,
-            sh.biases.data_ptr + local_row * sh.biases.row_bytes,
-            s_cols * sizeof(uint16_t));
+        int m = static_cast<int>(local_rows.size());
+        int w_cols = static_cast<int>(sh.weight.cols);
+        int s_cols = static_cast<int>(sh.scales.cols);
+
+        std::vector<uint32_t> w_buf(static_cast<size_t>(m) * w_cols);
+        std::vector<uint16_t> s_buf(static_cast<size_t>(m) * s_cols);
+        std::vector<uint16_t> b_buf(static_cast<size_t>(m) * s_cols);
+        for (int i = 0; i < m; ++i) {
+            int64_t lr = local_rows[i];
+            std::memcpy(w_buf.data() + static_cast<size_t>(i) * w_cols, sh.weight.data_ptr + lr * sh.weight.row_bytes, w_cols * sizeof(uint32_t));
+            std::memcpy(s_buf.data() + static_cast<size_t>(i) * s_cols, sh.scales.data_ptr + lr * sh.scales.row_bytes, s_cols * sizeof(uint16_t));
+            std::memcpy(b_buf.data() + static_cast<size_t>(i) * s_cols, sh.biases.data_ptr + lr * sh.biases.row_bytes, s_cols * sizeof(uint16_t));
+        }
+        auto w_arr = mx::array(w_buf.data(), {m, w_cols}, mx::uint32);
+        auto s_arr = mx::array(reinterpret_cast<const mx::bfloat16_t*>(s_buf.data()), {m, s_cols}, mx::bfloat16);
+        auto b_arr = mx::array(reinterpret_cast<const mx::bfloat16_t*>(b_buf.data()), {m, s_cols}, mx::bfloat16);
+        auto deq = mx::dequantize(w_arr, s_arr, b_arr, sh.group_size, sh.bits, "affine");
+        auto vals = mx::astype(deq, mx::bfloat16) * ple_.weight_scale;
+        part_vals.push_back(std::move(vals));
     }
 
-    auto w_arr = mx::array(w_buf.data(), {total_rows, w_cols}, mx::uint32);
-    auto s_arr = mx::array(reinterpret_cast<const mx::bfloat16_t*>(s_buf.data()), {total_rows, s_cols}, mx::bfloat16);
-    auto b_arr = mx::array(reinterpret_cast<const mx::bfloat16_t*>(b_buf.data()), {total_rows, s_cols}, mx::bfloat16);
-
-    auto deq = mx::dequantize(w_arr, s_arr, b_arr, group_size, bits, "affine");
-    auto values_emb = mx::astype(deq, mx::bfloat16) * ple_.weight_scale;
+    mx::array cat_vals = (part_vals.size() == 1) ? part_vals[0] : mx::concatenate(part_vals, 0);
+    std::vector<int32_t> inv(total_rows);
+    for (int pos = 0; pos < total_rows; ++pos) {
+        inv[order[pos]] = pos;
+    }
+    auto values_emb = mx::take(cat_vals, mx::array(inv.data(), {total_rows}, mx::int32), 0);
     auto embeddings = mx::reshape(values_emb, {batch, seq_len, ple_.ple_embed_dim});
 
     auto keys_proj = ple_.key_proj.forward(embeddings);
@@ -239,7 +261,8 @@ mx::array Qwen38Engine::run_ple(
         {batch, seq_len, ple_.hc_count, ple_.hidden_size});
 
     float sqrt_h = std::sqrt(static_cast<float>(ple_.hidden_size));
-    auto gate = mx::divide(mx::sum(keys * queries, -1, true), mx::array(sqrt_h, keys.dtype()));
+    auto sum_kq = mx::sum(keys * queries, -1, true);
+    auto gate = mx::divide(sum_kq, mx::array(sqrt_h, sum_kq.dtype()));
     auto eps_gate = mx::array(1e-6f, gate.dtype());
     gate = mx::sign(gate) * mx::sqrt(mx::maximum(mx::abs(gate), eps_gate));
     auto gated_values = mx::sigmoid(gate) * mx::expand_dims(values, -2);
@@ -262,8 +285,11 @@ mx::array Qwen38Engine::run_ple(
     int taps = ple_.conv_kernel_size;
     int dil = ple_.conv_dilation;
     auto& conv_k = get_ple_conv_kernel();
+    auto conv_w = (ple_.short_conv_weight.dtype() == normed.dtype())
+        ? ple_.short_conv_weight
+        : mx::astype(ple_.short_conv_weight, normed.dtype());
     auto conv_out = conv_k(
-        {conv_input, ple_.short_conv_weight},
+        {conv_input, conv_w},
         {{batch, seq_len, channels}},
         {normed.dtype()},
         {channels, seq_len, batch},

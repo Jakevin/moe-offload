@@ -205,7 +205,7 @@ Qwen38Engine::Qwen38Engine(const EngineOptions& opts) : opts_(opts) {
 
 Qwen38Engine::~Qwen38Engine() {
     stop_memory_monitor();
-    if (loaded_) {
+    if (loaded_ && !is_k50_v3_) {
         for (int l = 1; l < 48; ++l) {
             wait_slot_reader(l);
             if (opts_.io_mode == "p1") {
@@ -239,20 +239,27 @@ void Qwen38Engine::wait_slot_reader(int layer_idx) {
 }
 
 void Qwen38Engine::reset_caches(bool reset_expert_lru) {
-    for (int l = 1; l < static_cast<int>(layers_.size()); ++l) {
-        wait_slot_reader(l);
-        if (opts_.io_mode == "p1") {
-            p1_sched_.wait_layer_all(l);
-            p1_sched_.reset_stats(l);
-            if (reset_expert_lru) {
-                p1_sched_.reset_cache(l);
-            }
-        } else {
-            c_layer_wait_demand(l);
-            c_layer_wait_prefetch(l);
-            c_layer_reset_stats(l);
-            if (reset_expert_lru) {
-                c_layer_reset_cache(l);
+    if (is_k50_v3_) {
+        k50_cache_.reset_stats();
+        if (reset_expert_lru) {
+            k50_cache_.clear_lru();
+        }
+    } else {
+        for (int l = 1; l < static_cast<int>(layers_.size()); ++l) {
+            wait_slot_reader(l);
+            if (opts_.io_mode == "p1") {
+                p1_sched_.wait_layer_all(l);
+                p1_sched_.reset_stats(l);
+                if (reset_expert_lru) {
+                    p1_sched_.reset_cache(l);
+                }
+            } else {
+                c_layer_wait_demand(l);
+                c_layer_wait_prefetch(l);
+                c_layer_reset_stats(l);
+                if (reset_expert_lru) {
+                    c_layer_reset_cache(l);
+                }
             }
         }
     }
@@ -362,6 +369,7 @@ mx::array Qwen38Engine::prefill(const std::vector<int32_t>& prompt_ids) {
     bool do_dump = should_dump_step(opts_, 0);
     std::unordered_map<std::string, mx::array> dump_map;
 
+    k50_cache_.in_prefill = true;
     for (int l = 0; l < 48; ++l) {
         auto& layer = layers_[l];
         if (l == 1 && ple_.active) {
@@ -391,7 +399,35 @@ mx::array Qwen38Engine::prefill(const std::vector<int32_t>& prompt_ids) {
         auto sh_gate = mx::sigmoid(layer.shared_expert_gate.forward(m_in));
         auto shared_y = sh_gate * sh_out;
 
-        auto moe_out = run_moe_prefill(l, m_in, inds, scores, shared_y);
+        mx::array moe_out = shared_y;
+        if (layer.k50_moe) {
+            auto y = layer.k50_switch.forward(m_in, inds, &k50_cache_);
+            moe_out = mx::sum(y * mx::expand_dims(scores, -1), -2) + shared_y;
+            auto h_written = hc_write(h, moe_out, m_inj);
+            if (opts_.sync_mode == "layer") {
+                if (layer.is_linear) {
+                    mx::eval({h_written, exec_caches_[l].conv_state, exec_caches_[l].ssm_state});
+                } else {
+                    mx::eval({h_written, exec_caches_[l].keys, exec_caches_[l].values});
+                }
+            }
+            if (do_dump) {
+                std::string lp = "layer" + std::to_string(l) + ".";
+                dump_map.emplace(lp + "mixed_attn", a_in);
+                dump_map.emplace(lp + "branch_attn", a_out);
+                dump_map.emplace(lp + "mixed_mlp", m_in);
+                dump_map.emplace(lp + "inds", inds);
+                dump_map.emplace(lp + "scores", scores);
+                dump_map.emplace(lp + "shared_y", shared_y);
+                dump_map.emplace(lp + "branch_mlp", moe_out);
+                dump_map.emplace(lp + "h_pre_moe", h);
+            }
+            h = h_written;
+            write = std::nullopt;
+            continue;
+        } else {
+            moe_out = run_moe_prefill(l, m_in, inds, scores, shared_y);
+        }
         write = std::make_pair(moe_out, m_inj);
 
         if (do_dump) {
@@ -406,6 +442,7 @@ mx::array Qwen38Engine::prefill(const std::vector<int32_t>& prompt_ids) {
             dump_map.emplace(lp + "h_pre_moe", h);
         }
     }
+    k50_cache_.in_prefill = false;
 
     auto [final_h, _w, _i] = run_hc(final_mixer_, h, write);
     auto logits = lm_head_last_row(lm_head_, final_h);
@@ -418,7 +455,7 @@ mx::array Qwen38Engine::prefill(const std::vector<int32_t>& prompt_ids) {
 
 mx::array Qwen38Engine::decode_step(int32_t token_id, int step_idx) {
     const bool use_p1 = (opts_.io_mode == "p1");
-    if (!use_p1) {
+    if (!use_p1 && !is_k50_v3_) {
         c_begin_decode_token(step_idx);
     }
     std::vector<int32_t> tok_vec = {token_id};
@@ -465,7 +502,34 @@ mx::array Qwen38Engine::decode_step(int32_t token_id, int step_idx) {
 
         mx::array moe_out = shared_y;
 
-        if (layer.resident_moe) {
+        if (layer.k50_moe) {
+            auto y = layer.k50_switch.forward(m_in, inds, &k50_cache_);
+            moe_out = mx::sum(y * mx::expand_dims(scores, -1), -2) + shared_y;
+            auto h_written = hc_write(h, moe_out, m_inj);
+            if (opts_.sync_mode == "layer") {
+                if (layer.is_linear) {
+                    mx::eval({h_written, exec_caches_[l].conv_state, exec_caches_[l].ssm_state});
+                } else {
+                    mx::eval({h_written, exec_caches_[l].keys, exec_caches_[l].values});
+                }
+            } else {
+                mx::async_eval({h_written});
+            }
+            if (do_dump) {
+                std::string lp = "layer" + std::to_string(l) + ".";
+                dump_map.emplace(lp + "mixed_attn", a_in);
+                dump_map.emplace(lp + "branch_attn", a_out);
+                dump_map.emplace(lp + "mixed_mlp", m_in);
+                dump_map.emplace(lp + "inds", inds);
+                dump_map.emplace(lp + "scores", scores);
+                dump_map.emplace(lp + "shared_y", shared_y);
+                dump_map.emplace(lp + "branch_mlp", moe_out);
+                dump_map.emplace(lp + "h_pre_moe", h);
+            }
+            h = h_written;
+            write = std::nullopt;
+            continue;
+        } else if (layer.resident_moe) {
             auto x_exp = mx::expand_dims(mx::expand_dims(m_in, -2), -2);
             auto u = layer.res_up_proj.forward(x_exp, inds, false);
             auto g = layer.res_gate_proj.forward(x_exp, inds, false);
@@ -681,7 +745,7 @@ mx::array Qwen38Engine::decode_step(int32_t token_id, int step_idx) {
     auto [final_h, _w, _i] = run_hc(final_mixer_, h, write);
     auto logits = lm_head_.forward(final_h);
 
-    if (!use_p1) {
+    if (!use_p1 && !is_k50_v3_) {
         uint64_t tok_stats[10]{};
         c_end_decode_token(tok_stats);
     }
@@ -907,6 +971,21 @@ static void drop_os_file_cache_for_cold(
     }
 }
 
+static uint64_t get_macos_avail_memory_bytes() {
+#ifdef __APPLE__
+    mach_port_t host = mach_host_self();
+    vm_size_t page_size = 16384;
+    host_page_size(host, &page_size);
+    vm_statistics64_data_t vm_stat{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm_stat), &count) == KERN_SUCCESS) {
+        uint64_t avail_pages = vm_stat.free_count + vm_stat.inactive_count + vm_stat.purgeable_count;
+        return avail_pages * static_cast<uint64_t>(page_size);
+    }
+#endif
+    return 16ULL << 30;
+}
+
 RunMetrics Qwen38Engine::generate(
     const std::vector<int32_t>& prompt_ids,
     int n_tokens,
@@ -914,11 +993,23 @@ RunMetrics Qwen38Engine::generate(
     uint64_t init_avail = 0, init_swap = 0, init_comp = 0;
     int init_plevel = 1;
     query_macos_memory(init_avail, init_swap, init_comp, init_plevel);
+    bool detect_k50 = std::filesystem::exists(opts_.model_dir + "/skeleton.safetensors") &&
+                      std::filesystem::exists(opts_.model_dir + "/nonexpert.safetensors");
     if (!loaded_) {
-        g_proc_limit_bytes.store(compute_proc_limit_bytes(init_avail));
-        std::fprintf(stderr, "[mem] proc_limit=%llu bytes (min(19.5e9, 0.8 x clean avail %llu before load); phys_footprint)\n",
-                     static_cast<unsigned long long>(g_proc_limit_bytes.load()),
-                     static_cast<unsigned long long>(init_avail));
+        if (detect_k50) {
+            uint64_t avail_b = get_macos_avail_memory_bytes();
+            uint64_t limit_80 = static_cast<uint64_t>(0.80 * static_cast<double>(avail_b));
+            mx::set_memory_limit(limit_80);
+            mx::set_cache_limit(2ULL << 30);
+            g_proc_limit_bytes.store(limit_80);
+            std::fprintf(stderr, "[mem] K50 v3 memory_limit=%.2f GiB (80%% of avail %.2f GiB), cache_limit=2.00 GiB, swap_used=%.2f MiB\n",
+                         limit_80 / 1073741824.0, avail_b / 1073741824.0, init_swap / 1048576.0);
+        } else {
+            g_proc_limit_bytes.store(compute_proc_limit_bytes(init_avail));
+            std::fprintf(stderr, "[mem] proc_limit=%llu bytes (min(19.5e9, 0.8 x clean avail %llu before load); phys_footprint)\n",
+                         static_cast<unsigned long long>(g_proc_limit_bytes.load()),
+                         static_cast<unsigned long long>(init_avail));
+        }
     }
 
     RunMetrics m{};
@@ -938,11 +1029,13 @@ RunMetrics Qwen38Engine::generate(
         check_process_memory_guard(init_swap);
 
         m.tokens.clear();
-        if (opts_.io_mode == "p1") {
-            for (int l = 1; l < 48; ++l) p1_sched_.reset_stats(l);
-        } else {
-            c_set_io_accounting(1);
-            for (int l = 1; l < 48; ++l) c_layer_reset_stats(l);
+        if (!is_k50_v3_) {
+            if (opts_.io_mode == "p1") {
+                for (int l = 1; l < 48; ++l) p1_sched_.reset_stats(l);
+            } else {
+                c_set_io_accounting(1);
+                for (int l = 1; l < 48; ++l) c_layer_reset_stats(l);
+            }
         }
 
         start_memory_monitor();
@@ -964,8 +1057,8 @@ RunMetrics Qwen38Engine::generate(
                      static_cast<unsigned long long>(g_peak_footprint_bytes.load()),
                      static_cast<unsigned long long>(g_proc_limit_bytes.load()));
 
-        if (!logits_out_path.empty() && rep == n_repeats - 1) {
-            saved_step_logits.push_back(mx::reshape(mx::astype(logits, mx::float32), {1, -1}));
+        if (!logits_out_path.empty() && rep == n_repeats - 1 && saved_step_logits.size() < 16) {
+            saved_step_logits.push_back(mx::reshape(logits, {1, -1}));
         }
 
         // Match server.py line 161: mx.clear_cache() after prefill
@@ -992,8 +1085,8 @@ RunMetrics Qwen38Engine::generate(
             next_tok = static_cast<int32_t>(next_tok_arr.item<uint32_t>());
             auto ts1 = std::chrono::steady_clock::now();
 
-            if (!logits_out_path.empty() && rep == n_repeats - 1) {
-                saved_step_logits.push_back(mx::reshape(mx::astype(logits, mx::float32), {1, -1}));
+            if (!logits_out_path.empty() && rep == n_repeats - 1 && saved_step_logits.size() < 16) {
+                saved_step_logits.push_back(mx::reshape(logits, {1, -1}));
             }
 
             step_ms.push_back(std::chrono::duration<double, std::milli>(ts1 - ts0).count());
@@ -1007,7 +1100,7 @@ RunMetrics Qwen38Engine::generate(
         auto t_dec1 = std::chrono::steady_clock::now();
         m.decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
 
-        if (opts_.io_mode == "p1") {
+        if (!is_k50_v3_ && opts_.io_mode == "p1") {
             for (int l = 1; l < 48; ++l) {
                 wait_slot_reader(l);
             }
@@ -1025,7 +1118,7 @@ RunMetrics Qwen38Engine::generate(
             if (!parent.empty()) {
                 std::filesystem::create_directories(parent);
             }
-            auto all_logits = mx::concatenate(saved_step_logits, 0);
+            auto all_logits = mx::astype(mx::concatenate(saved_step_logits, 0), mx::float32);
             mx::eval({all_logits});
             if (logits_out_path.size() >= 12 &&
                 logits_out_path.substr(logits_out_path.size() - 12) == ".safetensors") {
@@ -1050,7 +1143,44 @@ RunMetrics Qwen38Engine::generate(
     }
 
     int dec_tokens = std::max(1, static_cast<int>(m.tokens.size()) - 1);
-    if (opts_.io_mode == "p1") {
+    if (is_k50_v3_) {
+        m.is_k50_v3 = true;
+        m.k50_pinned_bytes = k50_cache_.pinned_bytes;
+        m.k50_lru_budget_bytes = k50_cache_.budget_bytes;
+        m.k50_lru_bytes = k50_cache_.lru_bytes;
+        m.k50_lru_entries = k50_cache_.lru_map.size();
+        m.k50_hot_hits = k50_cache_.hot_hits;
+        m.k50_lru_hits = k50_cache_.lru_hits;
+        m.k50_misses = k50_cache_.misses;
+        m.k50_evictions = k50_cache_.evictions;
+        m.k50_prefill_hot_hits = k50_cache_.prefill_hot_hits;
+        m.k50_prefill_lru_hits = k50_cache_.prefill_lru_hits;
+        m.k50_prefill_misses = k50_cache_.prefill_misses;
+
+        m.lru_hits = k50_cache_.hot_hits + k50_cache_.lru_hits;
+        m.demand_misses = k50_cache_.misses;
+        m.decode_requests = m.lru_hits + m.demand_misses;
+        if (m.decode_requests > 0) {
+            m.cache_hit_rate = static_cast<double>(m.lru_hits) / static_cast<double>(m.decode_requests);
+        }
+        m.slot_buffer_bytes = k50_cache_.pinned_bytes + k50_cache_.lru_bytes;
+        std::fprintf(stderr,
+                     "[k50] cache summary: pinned=%.2f GB, lru_budget=%.2f GB, lru_used=%.2f GB (%llu entries), "
+                     "decode(hot_hits=%llu lru_hits=%llu misses=%llu evictions=%llu hit_rate=%.2f%%), "
+                     "prefill(hot_hits=%llu lru_hits=%llu misses=%llu)\n",
+                     m.k50_pinned_bytes / 1e9,
+                     m.k50_lru_budget_bytes / 1e9,
+                     m.k50_lru_bytes / 1e9,
+                     static_cast<unsigned long long>(m.k50_lru_entries),
+                     static_cast<unsigned long long>(m.k50_hot_hits),
+                     static_cast<unsigned long long>(m.k50_lru_hits),
+                     static_cast<unsigned long long>(m.k50_misses),
+                     static_cast<unsigned long long>(m.k50_evictions),
+                     m.cache_hit_rate * 100.0,
+                     static_cast<unsigned long long>(m.k50_prefill_hot_hits),
+                     static_cast<unsigned long long>(m.k50_prefill_lru_hits),
+                     static_cast<unsigned long long>(m.k50_prefill_misses));
+    } else if (opts_.io_mode == "p1") {
         P1LayerStats tot = p1_sched_.get_total_stats(48);
         m.decode_requests = tot.decode_requests;
         m.lru_hits = tot.lru_hits;
@@ -1107,11 +1237,13 @@ RunMetrics Qwen38Engine::generate(
         m.forced_invalidations = forced_invalidations_;
     }
 
-    m.per_layer_cap.assign(current_caps_.begin() + 1, current_caps_.end());
-    uint64_t total_slots = 0;
-    for (int c : m.per_layer_cap) total_slots += static_cast<uint64_t>(c);
-    m.slot_buffer_bytes = total_slots * 1536000ULL;
-    m.peak_rss_bytes = get_phys_footprint_bytes();
+    if (!is_k50_v3_) {
+        m.per_layer_cap.assign(current_caps_.begin() + 1, current_caps_.end());
+        uint64_t total_slots = 0;
+        for (int c : m.per_layer_cap) total_slots += static_cast<uint64_t>(c);
+        m.slot_buffer_bytes = total_slots * 1536000ULL;
+    }
+    m.peak_rss_bytes = std::max(get_phys_footprint_bytes(), g_peak_footprint_bytes.load());
     m.mlx_active_bytes = mx::get_active_memory();
     m.mlx_peak_bytes = mx::get_peak_memory();
     m.mlx_cache_bytes = mx::get_cache_memory();

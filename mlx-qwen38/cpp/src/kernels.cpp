@@ -995,9 +995,23 @@ static const char* kMropeApplyHalfSplit64_3dSource = R"(
 )";
 
 mx::array QLinear::forward(const mx::array& x) const {
-    mx::array y = is_quantized
-        ? mx::quantized_matmul(x, weight, *scales, biases, true, group_size, bits, "affine")
-        : mx::matmul(x, mx::transpose(weight));
+    mx::array y = mx::zeros({0});
+    if (is_quantized) {
+        if (reshape_2d && x.ndim() > 2) {
+            auto in_shape = x.shape();
+            int k_dim = in_shape.back();
+            int out_dim = weight.shape(0);
+            auto flat = mx::reshape(x, {-1, k_dim});
+            auto out = mx::quantized_matmul(flat, weight, *scales, biases, true, group_size, bits, "affine");
+            mx::Shape out_shape = in_shape;
+            out_shape.back() = out_dim;
+            y = mx::reshape(out, out_shape);
+        } else {
+            y = mx::quantized_matmul(x, weight, *scales, biases, true, group_size, bits, "affine");
+        }
+    } else {
+        y = mx::matmul(x, mx::transpose(weight));
+    }
     if (bias.has_value()) {
         y = y + *bias;
     }
@@ -1359,6 +1373,31 @@ std::tuple<mx::array, mx::array, mx::array> Qwen38Engine::run_hc(
     int lowrank = hc.hc_lowrank;
     int width = hc_count * hidden;
     auto dtype = h.dtype();
+
+    if (!hc.down.is_quantized) {
+        mx::array written = h;
+        if (write.has_value()) {
+            const auto& branch_output = write->first;
+            const auto& weights = write->second;
+            auto inj = mx::expand_dims(branch_output, -2) * mx::expand_dims(weights, -1);
+            written = written + mx::reshape(inj, written.shape());
+        }
+        auto normed = qwen4_rms_norm(written, hc.norm_weight, hc.eps, hidden);
+        auto mix = hc.down.forward(normed);
+        auto inv_hc = mx::array(static_cast<float>(hc_count), mix.dtype());
+        mix = silu_compiled_({mix / inv_hc})[0];
+        mix = mx::sigmoid(hc.up.forward(mix));
+        auto grouped_mix = mx::reshape(mix, {batch, seq, hc_count, hidden});
+        auto streams = mx::reshape(normed, {batch, seq, hc_count, hidden});
+        auto mixed_input = mx::mean(grouped_mix * streams, -2);
+        if (!hc.use_combine) {
+            return {mixed_input, written, mx::zeros({batch, seq, hc_count}, dtype)};
+        }
+        auto block_inj = hc.inject.forward(normed);
+        auto inj_weights = mx::array(2.0f, block_inj.dtype()) * mx::sigmoid(block_inj / inv_hc);
+        return {mixed_input, written, inj_weights};
+    }
+
     auto flat = mx::reshape(h, {rows, width});
     int inj_flag = hc.use_combine ? 1 : 0;
 
